@@ -1,4 +1,5 @@
 import argparse
+import sys
 import random
 import string
 import torch
@@ -10,12 +11,12 @@ from phonemizer.backend import BACKENDS
 
 from tqdm import tqdm
 
-try:
-	import pykakasi
-except Exception as e:
-	pykakasi = None
-	print(f'Error while importing pykakasi: {str(e)}')
-	pass
+# try:
+# 	import pykakasi
+# except Exception as e:
+# 	pykakasi = None
+# 	print(f'Error while importing pykakasi: {str(e)}')
+# 	pass
 
 try:
 	import langdetect
@@ -34,12 +35,13 @@ def _get_graphs(path):
 	return graphs
 
 def coerce_to_hiragana( runes, sep="" ):	
-	if pykakasi is None:
-		raise Exception('pykakasi is not installed.')
+	# if pykakasi is None:
+	# 	raise Exception('pykakasi is not installed.')
 
-	kks = pykakasi.kakasi()
-	result = kks.convert( runes )
-	return sep.join([ res['hira'] for res in result ])
+	# kks = pykakasi.kakasi()
+	# result = kks.convert( runes )
+	# return sep.join([ res['hira'] for res in result ])
+	sys.exit("hiragana not supported in this version")
 
 def coerce_language( lang ):
 	# bottle of water vs bo'oh'o'wa'er

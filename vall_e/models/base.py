@@ -60,7 +60,7 @@ task_outputs = {
 }
 
 # yuck
-def _get_offsets():
+def _get_offsets(): ##all the tokens for the unified(un-splitted) classifier?
 	return {
 		"text": (0, 256), 
 		"quant_level": (256, 264), 
@@ -180,7 +180,7 @@ class MultiEmbedding(nn.Module):
 			padded_x_list.append(xi.to(w))
 
 		x = torch.cat(padded_x_list)  # n l k
-		x = einsum("l k d, n l k -> n d", w, x)
+		x = einsum("l k d, n l k -> n d", w, x)  ##this is for the purpose of "summation of embeddings of prior layers"
 
 		x_list = x.split([*map(len, x_list)])
 
@@ -456,7 +456,7 @@ class Base(nn.Module):
 		self.gradient_checkpointing = self.config.gradient_checkpointing if self.config is not None else True
 
 		self.stop_token = self.n_audio_tokens # id 1024
-		self.causal = "ar" in self.capabilities or "len" in self.capabilities
+		self.causal = "ar" in self.capabilities or "len" in self.capabilities  ## controls if use causal-attention in transformer block
 		self.version = self.config.version if self.config is not None else 5
 		self.causal_size = self.config.experimental.causal_size if self.config is not None else (1 if self.causal else 0)
 
@@ -499,19 +499,19 @@ class Base(nn.Module):
 
 		# pure AR
 		if "nar" not in self.capabilities:
-			n_resp_tokens = n_audio_tokens + 1
-			l_embedding_tokens = [n_resp_tokens] * self.n_resp_levels
+			n_resp_tokens = n_audio_tokens + 1 ## + 1 mask for input and + 1 stop for output?
+			l_embedding_tokens = [n_resp_tokens] * self.n_resp_levels ##input for each level?
 			l_embedding_names = [f'AR:{i}:{i}' for i in range( self.n_resp_levels )]
-			l_classifier_tokens = [n_resp_tokens] * self.n_resp_levels
+			l_classifier_tokens = [n_resp_tokens] * self.n_resp_levels ##output for each level?
 		# NAR-len model
 		elif "len" in self.capabilities:
 			# +1 to include the stop or mask token
-			n_resp_tokens = n_audio_tokens + ( 1 if self.causal_size > 0 else 0 )
-			if "ar" in self.capabilities:
+			n_resp_tokens = n_audio_tokens + ( 1 if self.causal_size > 0 else 0 ) # causal_size is the number of output each time-step for AR
+			if "ar" in self.capabilities: ##use AR:0:0 to estimate the "len" for NAR? AR needs to predict "stop" whilst nar0 uses mask but don't predict [mask] 
 				l_embedding_tokens = [n_resp_tokens] + [n_resp_tokens - 1] * (self.n_resp_levels - 1) + [n_resp_tokens]
 				l_classifier_tokens = [n_resp_tokens] + [n_resp_tokens - 1] * (self.n_resp_levels - 1) + [n_resp_tokens - 1]
 				l_embedding_names = ['AR:0:0'] + [f'NAR:{i}:{i+1}' for i in range( self.n_resp_levels - 1 )] + ['NAR:0:0']
-			else:
+			else: ##pure NAR? lenth is already known, NAR level 0 need mask as input, but why +1 for output?
 				l_embedding_tokens = [n_resp_tokens] + [n_resp_tokens - 1] * (self.n_resp_levels - 1)
 				l_classifier_tokens = [n_resp_tokens] + [n_resp_tokens - 1] * (self.n_resp_levels - 1)
 				l_embedding_names = ['NAR:0:0'] + [f'NAR:{i}:{i+1}' for i in range( self.n_resp_levels - 1 )]
@@ -646,7 +646,7 @@ class Base(nn.Module):
 				d_model=d_model,
 				n_heads=n_heads,
 				p_dropout=p_dropout if training else 0.0,
-				causal=self.causal,
+				causal=self.causal, ## this ar-nar behavior can not be controled dynamically?
 				norm_type="ln", # adaln
 				n_levels=self.n_resp_levels,
 			) for _ in range(n_layers) ])
@@ -671,9 +671,7 @@ class Base(nn.Module):
 					#gradient_checkpointing=self.gradient_checkpointing,
 				))
 
-				# replace with desired attention
-				if attention_backend not in HF_ATTENTIONS:
-					self.model = ml.replace_attention( self.model, klass=LlamaAttention_Adapted, target=LlamaAttention, mode=attention_backend )
+				self.model = ml.replace_attention( self.model, klass=LlamaAttention_Adapted, target=LlamaAttention, mode=attention_backend )
 			else:
 				self.model = MixtralModel_Adapted(MixtralConfig(
 					vocab_size =n_resp_tokens,
@@ -1014,6 +1012,7 @@ class Base(nn.Module):
 				# "encode" length to tokens for 0-9 + stop
 				elif resps_list is not None and resps_list[i] is not None:
 					# yes this could be encoded better
+					# 0,1,2,3,10(stop) => len = 123?
 					inputs[i].append( ( "len", torch.tensor([ 0 ] + [ int(i) for i in str( resps_list[i].shape[0]) ] + [ 10 ], device=device, dtype=torch.int16) ) )
 				
 				inputs[i].append( ("classifier_level", "len") )
@@ -1109,15 +1108,15 @@ class Base(nn.Module):
 
 	def inputs_to_embeddings(
 		self,
-		inputs: list,
+		inputs: list, ##  alist of tenssor of shape=(8,)
 		quant_levels: int | list[int] | Tensor | None = None
 	):
-		# handles tasks where the prompt has task tokens injected in the middle
+		# handles tasks where the prompt has task tokens injected in the middle -- "#old models have the task tokens in the prom"
 		def prompt_input_to_embedding( input, quant_level ):
 			if isinstance(input, str):
 				return self.tasks_emb( torch.tensor( [ get_task_symmap()[input] ], device=device, dtype=torch.int16) )
 
-			# get RVQ level 0, or up to targetted RVQ level inference
+			# get RVQ level 0, or up to targetted RVQ level inference -- because "we need to sum up the embedding till quant_level"
 			if self.version <= 4:
 				return self.proms_emb(
 					input if quant_level == 0 else input[:, :quant_level]
@@ -1153,7 +1152,7 @@ class Base(nn.Module):
 			
 			# pre-iterate
 			for name, input in batch_input:
-				if name == "classifier_level":
+				if name == "classifier_level": ## a batch will only process at the same level ?
 					classifier_level = input
 				elif name == "dropout_mask":
 					dropout_mask = input
@@ -1193,7 +1192,7 @@ class Base(nn.Module):
 				elif name == "tone" and self.tones_emb is not None:
 					embedding = self.tones_emb( input )
 				elif name == "resp":
-					if self.interleave:
+					if self.interleave: ## all AR? diabled in document!!!
 						embeddings = [ self.resps_emb(
 							input[:, :l+1],
 							#offset = 0,
@@ -1207,7 +1206,7 @@ class Base(nn.Module):
 					elif dropout_mask is not None:
 						embedding = self.resps_emb(
 							# if masked use masked token, else original token
-							torch.where( dropout_mask, self.stop_token, input if input.dim() == 1 else input[:, 0] ),
+							torch.where( dropout_mask, self.stop_token, input if input.dim() == 1 else input[:, 0] ), 
 							#quant_level = 0,
 							name = classifier_level,
 						)
@@ -1379,6 +1378,7 @@ class Base(nn.Module):
 				return torch.tensor( [ get_task_symmap()[input] ], device=device, dtype=torch.int16)
 
 			# ignore prom, fill with mock tokens, because the prom embeddings don't directly map to tokens
+			# prompt no gradient if sum!!!!!  even if transformer will have output for each input token
 			if self.version < 4 or (self.version >= 5 and self.config and self.config.experimental.audio_embedding_sums):
 				return torch.full_like(input[..., 0], self.ignore_index)
 				
@@ -1423,7 +1423,7 @@ class Base(nn.Module):
 					# iterate over the list to inject their tokens
 					token = torch.cat( [ prompt_input_to_token( input, quant_level ) for input in proms if input is not None ] )
 				elif name == "resp":
-					# mask found, apply it
+					# mask found, apply it, it could be AR mask and pure-NAR training mask!!!!!!
 					if dropout_mask is not None:
 						# if mask use original token, else ignore
 						token = torch.where( dropout_mask, input if input.dim() == 1 else input[:, 0], self.ignore_index )
@@ -1479,7 +1479,7 @@ class Base(nn.Module):
 
 				if ignored:
 					# pruned
-					if self.config.loss_factors:
+					if self.config.loss_factors: ### will instead assign 0 weight so no need to set ignored????
 						continue
 					# fill with ignored out tensor
 					token = torch.tensor( [ self.ignore_index ] * token.shape[0], device=device, dtype=torch.int16)
@@ -1495,7 +1495,7 @@ class Base(nn.Module):
 
 					if causal and seq_len > 1:
 						l = self.causal_size
-						logit = logit[..., :-l, :]
+						logit = logit[..., :-l, :]  ### to match the position of predicted logits and the labels!!!!!! take l=1 as example
 						token = token[..., l:] # shift sequence to the right by one (or causal chunk size)
 
 					if compute_hard_loss:
@@ -1524,8 +1524,8 @@ class Base(nn.Module):
 				else:
 					target.append( token )
 			
-			# perofrm loss calculation on the entire sequence
-			if not self.config.loss_factors:
+			# perofrm loss calculation on the entire sequence 
+			if not self.config.loss_factors: ### no need to process it part by part
 				target = _join( target, torch.tensor(self.ignore_index, device=target[-1].device) )
 				logit = logits[batch_index]
 
@@ -1576,7 +1576,7 @@ class Base(nn.Module):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 	):
-		# return early if it's "good" enough"
+		# return early if it's "good" enough" ## early-exit schema? skip-layer?
 		# lambda because we need to capture the classifier_levels and mask
 		exited_layer = self.n_layers
 		def layer_skip_lambda( layer, logits ):
@@ -1621,12 +1621,12 @@ class Base(nn.Module):
 			quant_levels = [ x.item() for x in self.get_input( inputs, "quant_level" ) ]
 
 		# inputs don't have quant levels added, pure AR
-		if len(quant_levels) != len(inputs):
+		if len(quant_levels) != len(inputs):  ## because NAR-training needs to sample from different quant_levels? weird. 
 			quant_levels = [ 0 for _ in range(len(inputs)) ]
 
 		x_list = self.inputs_to_embeddings( inputs, quant_levels )
 		
-		x, mask = list_to_tensor(x_list)
+		x, mask = list_to_tensor(x_list) ### this is important for batch processing in the pytorch models? always pad 0?
 
 		training = self.training
 		teaching = self.teaching
@@ -1654,18 +1654,23 @@ class Base(nn.Module):
 		m = mask.unsqueeze(dim=-1)
 
 		# needs to be done here as we still have our raw inputs
-		position_ids = self.inputs_to_position_ids( inputs, mask=mask ) if not self.unified_position_ids else None
+		position_ids = self.inputs_to_position_ids( inputs, mask=mask ) if not self.unified_position_ids else None ##for getting positional embedding later? ids can be unified/separated?
 		classifier_levels = self.get_input( inputs, name="classifier_level" )
 		casual_levels = [ "AR:0:0", "stt", "len", "phn" ]
 
 		# right now limit to new versions because I need to retrain the model for noncausal masks...
 		is_causal = [ l in casual_levels for l in classifier_levels ] if self.noncausal_masks else [ True for l in classifier_levels ]
 
+		##hot fix for MDD
+		# is_causal = [ l in casual_levels for l in classifier_levels ] if self.noncausal_masks else [ True for l in classifier_levels ]
+		# assert len(is_causal) == 1
+		# is_causal = is_causal[0]
+  
 		output = self._forward(
 			inputs=x,
 			mask=mask,
 			state=state,
-			is_causal=is_causal,
+			is_causal=is_causal, ### is_causal will cause to generate the causal mask of input, it's 4D, BX1XTXT. corresponding to MHA B x H x Q x K 
 			position_ids=position_ids,
 			output_attentions = output_attentions,
 			output_hidden_states = output_hidden_states,
@@ -1700,6 +1705,7 @@ class Base(nn.Module):
 				hidden_states[i] = [ hi[:li] for hi, li in zip(hidden_states[i], map(len, x_list)) ]
 		
 		# de-offset if needed
+		##off set here are the output tokens
 		if self.classifier is not None:
 			offsets = _get_offsets()
 			for batch_index, classifier_level in enumerate( classifier_levels ):
@@ -1724,7 +1730,7 @@ class Base(nn.Module):
 			self.loss = None
 			self.stats = None
 		# compute loss if the target is given
-		else:
+		else: ## each call only generate the loss for one level of codes
 			loss, stats = self.calc_loss( inputs=inputs, logits=logits, quant_levels=quant_levels )
 
 			# compute it as an aux-loss
@@ -1831,7 +1837,8 @@ class Base(nn.Module):
 		"""
 
 		# (NAR) return the entire generated response
-		# Parallel decoding relies on the last N tokens in the logits, because each token predicts the next RVQ layer in the same place (forgetfully obviously)		
+		# Parallel decoding relies on the last N tokens in the logits, because each token predicts the next RVQ layer in the same place (forgetfully obviously)	
+		## transformer will generate the same number of tokens as input (prompts as well), only last L logtis are related to output???
 		if quant_levels is not None: #  and "nar" in self.capabilities: # for when I get around to coping about dropping the NAR entirely
 			seq_lens = map(len, prev_list)
 			logits = [ logit[-l:] for logit, l in zip(logits, seq_lens) ]
@@ -1890,6 +1897,7 @@ class Base(nn.Module):
 		# picks the top-k across all batches, and re-batches those resultant tokens
 		# returns the logit scores as well to be P-concatted with the previous scores
 		# to-do: not naively implement beam searching
+		## strange can't understand it!
 		elif beam_width > 1:
 			candidates = top_k_logits_list( logits, beam_width )
 			res = [ torch.tensor(token, dtype=torch.int16).unsqueeze(dim=-1) for batch, token in candidates ]

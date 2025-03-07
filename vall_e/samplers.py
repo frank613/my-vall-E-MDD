@@ -141,13 +141,12 @@ def dynamic_temperature( logits, temperature=1.0, min_temperature = 0.0, k = 10,
 	return logits
 
 
-
 # picks the top K tokens amongst a batch of logits
 # logits: [Tensor] list of logits
 # candidates: [(batch, token)] list, where batch indicates the index of the logits the given token is from
 def top_k_logits_list( logits_list, k ):
 	# ( batch, tokens ) => ( batch x tokens )
-	logits = torch.cat( logits_list )
+	logits = torch.cat( logits_list )  # just B X T X V matrix?
 	candidates = list(torch.topk(logits.flatten(), k).indices.tolist()) # perform top-k across all logits
 	for i, index in enumerate(candidates):
 		t = []

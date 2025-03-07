@@ -8,6 +8,7 @@ import argparse
 
 import torch
 import torchaudio
+import pdb
 
 """
 try:
@@ -24,7 +25,7 @@ from functools import cache
 from tqdm.auto import tqdm
 from pathlib import Path
 
-from ..utils import coerce_dtype
+from vall_e.utils import coerce_dtype
 
 def pad(num, zeroes):
 	return str(num).zfill(zeroes+1)
@@ -74,12 +75,18 @@ def _load_model(model_name="openai/whisper-large-v3", device="cuda", dtype="floa
 		model_name = model_name.replace("openai/whisper-", "")
 		model = whisperx.load_model(model_name, **kwargs)
 	else:
+		# model = pipeline(
+		# 	"automatic-speech-recognition",
+		# 	model=model_name,
+		# 	torch_dtype=coerce_dtype(dtype),
+		# 	device=device,
+		# 	model_kwargs={"attn_implementation": attention},
+		# )
 		model = pipeline(
 			"automatic-speech-recognition",
 			model=model_name,
 			torch_dtype=coerce_dtype(dtype),
 			device=device,
-			model_kwargs={"attn_implementation": attention},
 		)
 
 	_cached_models["model"] = (cache_key, model)
@@ -171,7 +178,12 @@ def transcribe(
 		if "timestamp" in segment:
 			s, e = segment["timestamp"]
 			start = min( start, s )
-			end = max( end, e )
+   			#end = max( end, e )
+			#hot bug fixing
+			if e:
+				end = max( end, e )
+			else:
+				end = start
 		else:
 			s, e = None, None
 
@@ -285,9 +297,9 @@ def transcribe_batch(
 		if not os.path.isdir(f'./{input_audio}/{dataset_name}/'):
 			continue
 
-		if group_name in ignore_groups:
+		if dataset_name in ignore_groups:
 			continue
-		if only_groups and group_name not in only_groups:
+		if only_groups and dataset_name not in only_groups:
 			continue
 
 		for speaker_id in tqdm(process_items(os.listdir(f'./{input_audio}/{dataset_name}/')), desc="Processing speaker"):

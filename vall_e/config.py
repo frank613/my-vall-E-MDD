@@ -23,6 +23,7 @@ from pathlib import Path
 from .utils.distributed import world_size
 from .utils.io import torch_load
 from .utils import set_seed, prune_missing, md5_hash, coerce_dtype
+import pdb
 
 @dataclass()
 class BaseConfig:
@@ -258,6 +259,7 @@ class ModelExperimentalSettings:
 	masking_train_p: float = 0.0 # odds of training with masking
 	masking_train_rvq_levels: list = field(default_factory=lambda: [0,0]) # determines which levels to do mask training on
 
+	###by default masking training with fixed masking rate 0.8, instead of sample a random schedual!!!
 	masking_ratio: str | float = 0.8 # sets a masking ratio, "random" will randomly pick, "rand" will pick between [0.2, 0.8]
 	ignore_inputs_for_loss: bool = True # only calculate the loss on the outputs since thats what matters, as the inputs that do have loss calculated upon affects the loss for the entire sequence
 

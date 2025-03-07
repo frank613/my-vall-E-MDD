@@ -18,6 +18,7 @@ from ..models.lora import apply_lora, lora_load_state_dict
 import torch
 import re
 import logging
+import sys
 
 _logger = logging.getLogger(__name__)
 
@@ -28,17 +29,17 @@ try:
 except Exception as e:
 	pass
 
-try:
-	import wandb
-except Exception as e:
-	_logger.warning(f'Failed to import wandb: {str(e)}')
-	wandb = None
+# try:
+# 	import wandb
+# except Exception as e:
+# 	_logger.warning(f'Failed to import wandb: {str(e)}')
+# 	wandb = None
 
 from functools import cache
 
 @cache
-def load_engines(training=True, **model_kwargs):
-	models = get_models(cfg.models, training=training, **model_kwargs)
+def load_engines(training=True, is_mdd=False, **model_kwargs):
+	models = get_models(cfg.models, training=training, is_mdd=is_mdd, **model_kwargs)
 	engines = dict()
 
 	for name, model in models.items():
@@ -359,18 +360,21 @@ def load_engines(training=True, **model_kwargs):
 			engine.module.eval()
 
 		# setup wandb
-		if engine._training and cfg.trainer.wandb and wandb is not None:
-			key_name = name
-			kwargs = {}
-			if cfg.lora is not None:			
-				key_name = cfg.lora.full_name
 
-			if world_size() > 1:
-				kwargs["group"] = "DDP"
+		# if engine._training and cfg.trainer.wandb and wandb is not None:
+		# 	key_name = name
+		# 	kwargs = {}
+		# 	if cfg.lora is not None:			
+		# 		key_name = cfg.lora.full_name
 
-			engine.wandb = wandb.init(project=key_name, **kwargs)
-			engine.wandb.watch(engine.module)
-		else:
-			engine.wandb = None
+		# 	if world_size() > 1:
+		# 		kwargs["group"] = "DDP"
+
+		# 	engine.wandb = wandb.init(project=key_name, **kwargs)
+		# 	engine.wandb.watch(engine.module)
+		# else:
+		# 	engine.wandb = None
+		if cfg.trainer.wandb:
+			sys.exit("wandb is not supported in this version")
 
 	return engines

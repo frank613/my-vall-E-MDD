@@ -33,7 +33,7 @@ def train_feeder(engine, batch, teacher=None):
 	with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
 		batch_size = len(batch["text"])
 		engine.current_batch_size = batch_size
-
+		##engine __call__ engine.forward()
 		output = engine(
 			text_list=batch["text"],
 			proms_list=batch["proms"],
@@ -99,7 +99,7 @@ def train_feeder(engine, batch, teacher=None):
 			for k in engine.module.loss.keys():
 				engine.module.loss[k] *= (1.0 - A)
 			engine.module.loss[L] = torch.stack(soft_losses).sum() * A * (T ** 2) / batch_size
-
+		## base model has an attritbues self.loss
 		losses = engine.gather_attribute("loss")
 		stat = engine.gather_attribute("stats")
 

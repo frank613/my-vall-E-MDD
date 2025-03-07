@@ -170,7 +170,7 @@ class PrenormResidual(nn.Module):
 		"""
 		nopts = {"l": l} if self.norm_type == "adaln" else {}
 		bopts = {"m": m} if self.requires_mask else {}
-		x = x + self.dropout(self.block(self.norm(x, **nopts) * m, **bopts))
+		x = x + self.dropout(self.block(self.norm(x, **nopts) * m, **bopts)) ## important to do norm before attention, it seems the above implementation of attention directly computes dot product as similarity?
 		return x * m
 
 

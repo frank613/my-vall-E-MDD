@@ -17,6 +17,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention, LlamaDecode
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 from .attention import *
+import pdb
 
 LN_2 = 0.69314718056
 
@@ -32,9 +33,16 @@ class LlamaAttention_Adapted(LlamaAttention):
 			self.mode = torch.nn.attention.SDPBackend.FLASH_ATTENTION
 		elif self.mode == "cudnn":
 			self.mode = torch.nn.attention.SDPBackend.CUDNN_ATTENTION
+		elif self.mode == "sdpa":
+			self.mode = torch.nn.attention.SDPBackend.MATH
 
 		super().__init__(*args, **kwargs)
 
+		if not hasattr(self, "num_heads"):
+			self.num_heads = self.config.num_attention_heads
+		if not hasattr(self, "num_key_value_heads"):
+			self.num_key_value_heads = self.config.num_key_value_heads
+   
 	# extracts inputs from a batch based on requested causality
 	def split_forward(
 		self,
@@ -389,6 +397,10 @@ class LlamaDecoderLayer_Adapted(LlamaDecoderLayer):
 		hidden_states = self.input_layernorm(hidden_states)
 		hidden_states = self.weigh_by_timestep( hidden_states, timesteps )
 		# Self Attention
+		# ugh
+		if isinstance( is_causal, list ) and len(is_causal) == 1:
+			is_causal = is_causal[0]
+		#pdb.set_trace()
 		hidden_states, self_attn_weights, present_key_value = self.self_attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
@@ -518,7 +530,7 @@ class LlamaModel_Adapted(LlamaModel):
 			return None
 		"""
 
-		past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+		past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0 ###past_key_values --- KV cache!!
 		using_static_cache = isinstance(past_key_values, StaticCache)
 
 		"""
@@ -537,7 +549,7 @@ class LlamaModel_Adapted(LlamaModel):
 		"""
 
 		dtype, device = input_tensor.dtype, input_tensor.device
-		sequence_length = input_tensor.shape[1]
+		sequence_length = input_tensor.shape[1] ###padded length!
 		if using_static_cache:
 			target_length = past_key_values.get_max_cache_shape()
 		else:
@@ -650,7 +662,7 @@ class LlamaModel_Adapted(LlamaModel):
 
 			x_mask = torch.stack( [ causal_mask[i, :, :, :] if state else noncausal_mask[i, :, :, :] for i, state in enumerate( is_causal ) ], dim=0 )
 		else:
-			x_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+			x_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)   ### x_mask if 4D, B x 1 x S x T, why? It corresponds to MHA B x H x Q x K
 
 		hidden_states = inputs_embeds
 

@@ -67,9 +67,9 @@ def sentence_split( s, split_by="sentences", quote_placeholder="<QUOTE>" ):
 # (it's not perfect but it works)
 
 try:
-	from tokenizers.normalizers import Lowercase, NFD, StripAccents
+	from tokenizers.normalizers import Lowercase, NFD, StripAccents, Sequence
 	
-	normalizer = tokenizers.normalizers.Sequence([Lowercase(), NFD(), StripAccents()])
+	normalizer = Sequence([Lowercase(), NFD(), StripAccents()])
 except Exception as e:
 	normalizer = None
 
@@ -991,7 +991,7 @@ class Dataset(_Dataset):
 		self.duration_map = None
 		self.duration_buckets = None
 
-		self.load_state_dict()
+		self.load_state_dict() # ## for sampler only? for resume checkpoings of training ?
 
 	@cached_property
 	def sampler_state_dict_path(self):
@@ -1044,7 +1044,7 @@ class Dataset(_Dataset):
 			}
 
 		if "dataset_hash_key" not in state_dict:
-			 state_dict["dataset_hash_key"] = self.dataset_hash_key
+			state_dict["dataset_hash_key"] = self.dataset_hash_key
 
 		torch_save(state_dict, path)
 
@@ -1301,7 +1301,7 @@ class Dataset(_Dataset):
 			if cfg.dataset.retokenize_text and "phonemes" in metadata:
 				text = torch.tensor(tokenize( metadata["phonemes"] )).to(self.text_dtype)
 		else:
-			resps, metadata = _load_artifact(path, return_metadata=True)
+			resps, metadata = _load_artifact(path, return_metadata=True) ## load the codes?
 			text = torch.tensor(tokenize( metadata["phonemes"] )).to(self.text_dtype)
 
 			lang = metadata["language"] if "language" in metadata else None

@@ -5,6 +5,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 import time
+import pdb
 
 _logger = logging.getLogger(__name__)
 
@@ -58,29 +59,49 @@ def download_model( save_path=DEFAULT_MODEL_PATH, chunkSize = 1024 ):
 	r.close()
 
 
-def get_model(config, training=True, **model_kwargs):
-	from .ar_nar import AR_NAR # import here because reasons
-	name = config.name
-	model = AR_NAR(
-		n_text_tokens=config.text_tokens,
-		n_audio_tokens=config.audio_tokens,
-		d_model=config.dim,
-		n_heads=config.heads,
-		n_layers=config.layers,
-		n_experts=config.experts,
-		
-		p_dropout=config.dropout,
-		
-		l_padding = config.input_alignment,
-		
-		training = training,
-		config = config,
-		**model_kwargs
-	)
-
+def get_model(config, training=True, is_mdd=False, **model_kwargs):
+	if not is_mdd:	
+		from .ar_nar import AR_NAR # import here because reasons
+		name = config.name
+		model = AR_NAR(
+			n_text_tokens=config.text_tokens,
+			n_audio_tokens=config.audio_tokens,
+			d_model=config.dim,
+			n_heads=config.heads,
+			n_layers=config.layers,
+			n_experts=config.experts,
+			
+			p_dropout=config.dropout,
+			
+			l_padding = config.input_alignment,
+			
+			training = training,
+			config = config,
+			**model_kwargs
+		)
+  
+	else:
+		from .nar_mdd import AR_NAR_MDD # extended for MDD
+		name = config.name
+		model = AR_NAR_MDD(
+			n_text_tokens=config.text_tokens,
+			n_audio_tokens=config.audio_tokens,
+			d_model=config.dim,
+			n_heads=config.heads,
+			n_layers=config.layers,
+			n_experts=config.experts,
+			
+			p_dropout=config.dropout,
+			
+			l_padding = config.input_alignment,
+			
+			training = training,
+			config = config,
+			**model_kwargs
+		)
 	_logger.info(f"{name} ({next(model.parameters()).dtype}): {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters")
 
 	return model
 
-def get_models(models, training=True, **model_kwargs):
-	return { model.full_name: get_model(model, training=training, **model_kwargs) for model in models }
+def get_models(models, training=True, is_mdd=False, **model_kwargs):
+	return { model.full_name: get_model(model, training=training, is_mdd=is_mdd, **model_kwargs) for model in models }

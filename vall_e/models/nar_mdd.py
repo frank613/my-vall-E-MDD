@@ -21,6 +21,7 @@ from torch import Tensor
 from tqdm import trange, tqdm
 
 import logging
+import pdb
 
 _logger = logging.getLogger(__name__)
 
@@ -37,9 +38,6 @@ class AR_NAR_MDD(Base):
 	def forward_super(self, *args, **kwargs):
 		return super().forward(*args, **kwargs)
 
-	# parse inputs for training
-	# a lot of this could be delegated back to the dataloader, but it's just easier to keep the task of the dataloader to provide sufficient data, and the model to process the data for training
- 
 	def forward_mdd_nar(
 		self,
 
@@ -51,7 +49,6 @@ class AR_NAR_MDD(Base):
 		
 		lang_list: list[Tensor] | None = None,
 		tone_list: list[Tensor] | None = None,
-		len_list: list[Tensor] | None = None,
 		raw_text_list: list[Tensor] | None = None,
 		pid_seq: list[list] | None = None,
 		is_masking_nar_level_0: bool | None = None,
@@ -77,10 +74,10 @@ class AR_NAR_MDD(Base):
 		assert all([True if task == "tts" else False for task in task_list])
 		assert self.config.experimental.token_dropout_error == 0 and self.config.experimental.token_dropout_rate == 0
   
-		if not total_levels:
+		if total_levels is None:
 			sys.exit("must specify the levels for computing GOP")
 	
-		iterator = trange(total_levels, desc="NAR")
+		iterator = trange(total_levels+1, desc="NAR")
 		for n in iterator:
 			level = n
 			if level == 0 and is_masking_nar_level_0:  ## NAR-mask for level 0
@@ -99,12 +96,16 @@ class AR_NAR_MDD(Base):
 					quant_levels=quant_levels,
 					pid_seq = pid_seq,
 					is_nar_level_0 = True,
+					masking_nar_level_0 = True
 				)
-				return super().forward(
+				Logits = super().forward(
 					inputs=inputs
 				)
+				avg_posteriors = Logits[3]
+				assert len(avg_posteriors) == len(pid_seq)
+				return avg_posteriors
 			elif not is_masking_nar_level_0:
-				sys.exit("only support is_masking_nar_level_0 = False")
+				sys.exit("only support is_masking_nar_level_0 = True")
 			else:  ## other NAR levels
 				pass
 	
@@ -943,7 +944,7 @@ class AR_NAR_MDD(Base):
 		pid_seq: list[list] | None = None,
 		is_mdd: bool | None = None,
 		is_masking_nar_level_0: bool | None = None, 
-
+		total_levels=None,
 		disable_tqdm=False,
 		use_lora=None,
 		**sampling_kwargs,
@@ -964,24 +965,23 @@ class AR_NAR_MDD(Base):
 			batch_size = len(resps_list) 
 
 		# check correct input for MDD
-		if is_mdd and text_list is not None and len_list is not None and resps_list is not None and proms_list is not None:
+		tts_check = [True if task=="tts" else False for task in task_list ]
+		all_tts = all(tts_check)
+		if is_mdd and all_tts and text_list is not None and resps_list is not None and proms_list is not None:
 			n_levels_set = {r.shape[-1] for r in resps_list} 
 			n_levels = next(iter(n_levels_set))
 			assert (n_levels == self.n_resp_levels)  ## resp must full 
 			return self.forward_mdd_nar(
 				task_list=task_list,
-
 				text_list=text_list,
 				proms_list=proms_list,
-				resps_list=resps_list,
-				
+				resps_list=resps_list,			
 				lang_list=lang_list,
 				tone_list=tone_list,
-				len_list=len_list,
 				raw_text_list=raw_text_list,
 				pid_seq=pid_seq,
 				is_masking_nar_level_0=is_masking_nar_level_0,
-
+				total_levels=total_levels,
 				disable_tqdm=disable_tqdm,
 				use_lora=use_lora,
 				**sampling_kwargs,

@@ -16,6 +16,7 @@ import random
 import numpy as np
 import re
 import sys
+import pdb
 
 from time import perf_counter
 from collections import namedtuple
@@ -49,7 +50,7 @@ from ..utils.pattern import DelayedPatternProvider, VALLEPattern
 
 summed_embeddings_task = [ "stt" ]
 special_tasks = [ "len", "stt", "phn", "un-phn" ]
-non_tokened_names = ["task", "dropout_mask", "classifier_level"]
+non_tokened_names = ["task", "dropout_mask", "classifier_level", "mdd_mask", "masking_nar_level_0"]
 task_outputs = {
 	"tts": "resp",
 	"ns": "resp",
@@ -100,9 +101,9 @@ def _dropout_mask( input, p=None ):
 	return mask
 
 def _mdd_mask( pid_seq, index, length, device ):
-    mask = torch.full(length, False, dtype=torch.bool, device=device )
+    mask = torch.full((length,), False, dtype=torch.bool, device=device )
     pid, l, r = pid_seq[index]
-    mask[l:r] = True
+    mask[l:r] = True ## 1 is masked! same as above, different from below, because later will we use "where" operation 
     return mask
 
 def _create_mask(l, device):
@@ -913,6 +914,8 @@ class Base(nn.Module):
 		time_list: list[Tensor] | None = None,
 		pid_seq: list[list] | None = None,
   		is_nar_level_0: bool | None = None,
+		masking_nar_level_0: bool | None = None,
+
 
 		quant_levels: int | list[int] | Tensor | None = None
 	):
@@ -991,11 +994,15 @@ class Base(nn.Module):
 				if resps_list is not None and resps_list[i] is not None:
 					inputs[i].append( ( "resp", resps_list[i] ) )
 				### mdd masking
-				if pid_seq is not None:
-						mdd_mask = _mdd_mask(pid_seq, i, resps_list.shape(0), device)
-						inputs[i].append( ("mdd_mask", mdd_mask ) )
-				if is_nar_level_0:
+				if pid_seq is None:
+					sys.exit("MDD must provide pid_seq as input")
+				else:
+					mdd_mask = _mdd_mask(pid_seq, i, resps_list[i].shape[0], device)  ## mdd_mask must be provided, regardless of using mask or not
+					inputs[i].append( ("mdd_mask", mdd_mask ) )
+				if is_nar_level_0 and quant_level == 0:
 					classifier_level = "NAR:0:0"
+				if masking_nar_level_0:
+					inputs[i].append( ("masking_nar_level_0", masking_nar_level_0) )
 				inputs[i].append( ("classifier_level", classifier_level) )
 			# Audio length prediction task
 			# Sequence: <text><sep><rvq lvl><prom><sep><len>
@@ -1174,6 +1181,8 @@ class Base(nn.Module):
 					sys.exit("no dropout_mask for MDD")
 				elif name == "mdd_mask":
 					mdd_mask = input
+				elif name == "masking_nar_level_0":
+					masking_nar_level_0 = input
 				elif name == "timestep":
 					timestep = input
 
@@ -1210,7 +1219,7 @@ class Base(nn.Module):
 				elif name == "tone" and self.tones_emb is not None:
 					embedding = self.tones_emb( input )
 				elif name == "resp":
-					if self.interleave: ## all AR? diabled in document!!!
+					if self.interleave: ## all AR? disabled in document!!!
 						embeddings = [ self.resps_emb(
 							input[:, :l+1],
 							#offset = 0,
@@ -1232,11 +1241,14 @@ class Base(nn.Module):
 					# NAR-len at level 0, do mask here for MDD
 					elif classifier_level == "NAR:0:0":
 						assert mdd_mask is not None
-						embedding = self.resps_emb(
-							torch.where( mdd_mask, self.stop_token, input if input.dim() == 1 else input[:, 0]),
-							#quant_level = 0,
-							name = classifier_level,
-						)
+						if masking_nar_level_0:
+							embedding = self.resps_emb(
+								torch.where( mdd_mask, self.stop_token, input if input.dim() == 1 else input[:, 0]),
+								#quant_level = 0,
+								name = classifier_level,
+							)
+						else:
+							embedding = input if input.dim() == 1 else input[:, 0]
 					# cheat-y way to handle performing STT across all levels
 					elif task_type in summed_embeddings_task:
 						# we do a manual sum because I trained it to use the AR embeddings + NAR embeddings for STT......
@@ -1375,6 +1387,95 @@ class Base(nn.Module):
 			ids = torch.stack( x_list )
 
 		return ids.to(device=device, dtype=torch.int32)
+
+	def calc_avg_posterior(self, inputs, logits, quant_levels):
+     
+		device = logits[0].device
+		avg_post_list = []
+		# handles tasks where the prompt has task tokens injected in the middle
+		def prompt_input_to_token( input, quant_level ):
+			if isinstance(input, str):
+				return torch.tensor( [ get_task_symmap()[input] ], device=device, dtype=torch.int16)
+
+			# ignore prom, fill with mock tokens, because the prom embeddings don't directly map to tokens
+			# prompt no gradient if sum!!!!!  even if transformer will have output for each input token
+			if self.version < 4 or (self.version >= 5 and self.config and self.config.experimental.audio_embedding_sums):
+				return torch.full_like(input[..., 0], self.ignore_index)
+				
+			return input if input.dim() == 1 else input[:, quant_level]
+
+		for batch_index, batch in enumerate(inputs):
+			quant_level = quant_levels[batch_index]
+			causal = True
+			for name, input in batch:
+				if name == "task":
+					task_type = input
+				elif name == "dropout_mask":
+					sys.exit("no dropout_mask for MDD")
+				elif name == "mdd_mask":
+					mdd_mask = input
+				elif name == "classifier_level": 
+					classifier_level = input
+			if quant_level == 0 and mdd_mask is None:
+				sys.exit("for now must provide mdd_mask for quant_level=0")
+			if classifier_level.startswith("NAR:"):
+				causal = False
+			else:
+				sys.exit("for now only supporting NAR for non-causal MDD")
+
+			it = 0
+			for name, input in batch:
+				token = None
+				ignored = False
+				# non-tokened tasks
+				if name in non_tokened_names:
+					continue
+				# prom can either be a tensor itself or a list of tensors and strings
+				if name == "prom":
+					# expand to list if not a list
+					proms = [ input ] if isinstance(input, torch.Tensor) else input
+					# iterate over the list to inject their tokens
+					token = torch.cat( [ prompt_input_to_token( input, quant_level ) for input in proms if input is not None ] )
+				elif name == "resp":
+					#pdb.set_trace()
+					if mdd_mask is None or self.interleave:
+						sys.exit("MDD must has a mdd_mask and non-interleave")
+					else:
+						# if mask use original token, else ignore
+						token = torch.where( mdd_mask, input if input.dim() == 1 else input[:, quant_level], self.ignore_index )
+				# not a special input, inject as-is
+				else:
+					token = input
+
+				if not isinstance(token, torch.Tensor):
+					continue
+				
+				if token.is_floating_point():
+					ignored = True
+
+				# grab range of our logits for latern
+				seq_len = token.shape[0]
+				start, end = it, it+seq_len
+				it += seq_len + 1 # +1 to incorporate the separator
+
+				# deduce if a name for a task is an input or output
+				# here for MDD, we use TTS as task so resp are the only tokens needed
+				if name != task_outputs.get(task_type, name):
+					if self.ignore_inputs_for_loss:
+						ignored = True
+
+				if ignored:
+					token = torch.tensor( [ self.ignore_index ] * token.shape[0], device=device, dtype=torch.int16)
+				
+				if any(token != self.ignore_index):
+					cur_logit = logits[batch_index][start:end].softmax(dim=-1)
+					## compute the avg_posterior
+					index1 = torch.nonzero(token>0, as_tuple=True)[0].tolist()
+					index2 = token[token>0].tolist()
+					avg_posterior = cur_logit[index1, index2].mean()
+					avg_post_list.append(avg_posterior.item())
+					break
+		return avg_post_list
 
 	def calc_loss(
 		self,
@@ -1644,14 +1745,16 @@ class Base(nn.Module):
 		if len(quant_levels) != len(inputs):  ## because NAR-training needs to sample from different quant_levels? weird. 
 			quant_levels = [ 0 for _ in range(len(inputs)) ]
 
+		self.get_input( inputs, "quant_level" )
 		x_list = self.inputs_to_embeddings( inputs, quant_levels )
 		
 		x, mask = list_to_tensor(x_list) ### this is important for batch processing in the pytorch models? always pad 0?
 
-		training = self.training
-		teaching = self.teaching
-		device = x.device
-		batch_size = len(x_list)
+		### MDD marks training as False
+		training = False
+		# teaching = self.teaching
+		# device = x.device
+		# batch_size = len(x_list)
 
 		# we only need hidden states if we're training with layerskip
 		if self.layerskip and training:
@@ -1664,11 +1767,10 @@ class Base(nn.Module):
 			shape[1] = self.l_padding - shape[1] % self.l_padding
 
 			padding = torch.zeros(shape, dtype=x.dtype, device=x.device)
-			x = torch.cat([x, padding], dim=1)
-
+			x = torch.cat([x, padding], dim=1) ## ??? why l_padding on the right?
 			# pad mask
 			shape[2] = 1
-			padding = torch.zeros(shape[:2], dtype=x.dtype, device=x.device)
+			padding = torch.zeros(shape[:2], dtype=x.dtype, device=x.device) ## padding zeros, zero represent invalid in the mask!!
 			mask = torch.cat([mask, padding], dim=1)
 		
 		m = mask.unsqueeze(dim=-1)
@@ -1744,42 +1846,44 @@ class Base(nn.Module):
 				logits[batch_index] = logits[batch_index][:, start:end]
 
 		if not training:
-			loss = None
+			loss = self.calc_avg_posterior(inputs=inputs, logits=logits, quant_levels=quant_levels)
 			stats = None
 
-			self.loss = None
 			self.stats = None
+			self.loss = None
+	
 		# compute loss if the target is given
 		else: ## each call only generate the loss for one level of codes
-			loss, stats = self.calc_loss( inputs=inputs, logits=logits, quant_levels=quant_levels )
+			sys.exit("MDD marks training as False")
+			# loss, stats = self.calc_loss( inputs=inputs, logits=logits, quant_levels=quant_levels )
 
-			# compute it as an aux-loss
-			if self.layerskip:
-				early_exit_loss = {}
-				if not hasattr( self, "training_steps" ):
-					self.training_steps = 0
+			# # compute it as an aux-loss
+			# if self.layerskip:
+			# 	early_exit_loss = {}
+			# 	if not hasattr( self, "training_steps" ):
+			# 		self.training_steps = 0
 				
-				for i, state in enumerate( hidden_states ):
-					loss, stats = self.calc_loss( inputs=inputs, logits=hidden_states[i], quant_levels=quant_levels )
+			# 	for i, state in enumerate( hidden_states ):
+			# 		loss, stats = self.calc_loss( inputs=inputs, logits=hidden_states[i], quant_levels=quant_levels )
 					
-					for k, v in loss.items():
-						K = f'early_exit.{k}'
-						if K not in early_exit_loss:
-							early_exit_loss[K] = []
-						early_exit_loss[K].append( v )
+			# 		for k, v in loss.items():
+			# 			K = f'early_exit.{k}'
+			# 			if K not in early_exit_loss:
+			# 				early_exit_loss[K] = []
+			# 			early_exit_loss[K].append( v )
 
-				for k, v in early_exit_loss.items():
-					loss[k] = self.model.early_exit_loss( losses=v, t=self.training_steps )
+			# 	for k, v in early_exit_loss.items():
+			# 		loss[k] = self.model.early_exit_loss( losses=v, t=self.training_steps )
 
-				# to-do: instead make the cirriculum rely on samples processed instead of steps
-				self.training_steps += 1 # batch_size
+			# 	# to-do: instead make the cirriculum rely on samples processed instead of steps
+			# 	self.training_steps += 1 # batch_size
 
-			# include any additional losses (for example: MoE router)
-			if output.loss is not None:
-				loss["aux_loss"] = output.loss
+			# # include any additional losses (for example: MoE router)
+			# if output.loss is not None:
+			# 	loss["aux_loss"] = output.loss
 
-			self.loss = loss
-			self.stats = stats
+			# self.loss = loss
+			# self.stats = stats
 			
 		# rewrap, because we're modifying the logits here
 		return Logits(logits, output.state, inputs, loss, output.attentions, hidden_states, exited_layer)

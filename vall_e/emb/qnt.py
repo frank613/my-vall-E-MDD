@@ -7,6 +7,7 @@ import torch
 import torchaudio
 import numpy as np
 import logging
+import sys
 
 _logger = logging.getLogger(__name__)
 
@@ -29,184 +30,185 @@ try:
 except Exception as e:
 	cfg.inference.use_vocos = False
 
-try:
-	from dac import DACFile
-	from audiotools import AudioSignal
-	from dac.utils import load_model as __load_dac_model
 
-	"""
-	Patch decode to skip things related to the metadata (namely the waveform trimming)
-	So far it seems the raw waveform can just be returned without any post-processing
-	A smart implementation would just reuse the values from the input prompt
-	"""
-	from dac.model.base import CodecMixin
+# try:
+# 	from dac import DACFile
+# 	from audiotools import AudioSignal
+# 	from dac.utils import load_model as __load_dac_model
 
-	@torch.no_grad()
-	def CodecMixin_compress(
-		self,
-		audio_path_or_signal: Union[str, Path, AudioSignal],
-		win_duration: float = 1.0,
-		verbose: bool = False,
-		normalize_db: float = -16,
-		n_quantizers: int = None,
-	) -> DACFile:
-		"""Processes an audio signal from a file or AudioSignal object into
-		discrete codes. This function processes the signal in short windows,
-		using constant GPU memory.
+# 	"""
+# 	Patch decode to skip things related to the metadata (namely the waveform trimming)
+# 	So far it seems the raw waveform can just be returned without any post-processing
+# 	A smart implementation would just reuse the values from the input prompt
+# 	"""
+# 	from dac.model.base import CodecMixin
 
-		Parameters
-		----------
-		audio_path_or_signal : Union[str, Path, AudioSignal]
-			audio signal to reconstruct
-		win_duration : float, optional
-			window duration in seconds, by default 5.0
-		verbose : bool, optional
-			by default False
-		normalize_db : float, optional
-			normalize db, by default -16
+# 	@torch.no_grad()
+# 	def CodecMixin_compress(
+# 		self,
+# 		audio_path_or_signal: Union[str, Path, AudioSignal],
+# 		win_duration: float = 1.0,
+# 		verbose: bool = False,
+# 		normalize_db: float = -16,
+# 		n_quantizers: int = None,
+# 	) -> DACFile:
+# 		"""Processes an audio signal from a file or AudioSignal object into
+# 		discrete codes. This function processes the signal in short windows,
+# 		using constant GPU memory.
 
-		Returns
-		-------
-		DACFile
-			Object containing compressed codes and metadata
-			required for decompression
-		"""
-		audio_signal = audio_path_or_signal
-		if isinstance(audio_signal, (str, Path)):
-			audio_signal = AudioSignal.load_from_file_with_ffmpeg(str(audio_signal))
+# 		Parameters
+# 		----------
+# 		audio_path_or_signal : Union[str, Path, AudioSignal]
+# 			audio signal to reconstruct
+# 		win_duration : float, optional
+# 			window duration in seconds, by default 5.0
+# 		verbose : bool, optional
+# 			by default False
+# 		normalize_db : float, optional
+# 			normalize db, by default -16
 
-		self.eval()
-		original_padding = self.padding
-		original_device = audio_signal.device
+# 		Returns
+# 		-------
+# 		DACFile
+# 			Object containing compressed codes and metadata
+# 			required for decompression
+# 		"""
+# 		audio_signal = audio_path_or_signal
+# 		if isinstance(audio_signal, (str, Path)):
+# 			audio_signal = AudioSignal.load_from_file_with_ffmpeg(str(audio_signal))
 
-		audio_signal = audio_signal.clone()
-		original_sr = audio_signal.sample_rate
+# 		self.eval()
+# 		original_padding = self.padding
+# 		original_device = audio_signal.device
 
-		resample_fn = audio_signal.resample
-		loudness_fn = audio_signal.loudness
+# 		audio_signal = audio_signal.clone()
+# 		original_sr = audio_signal.sample_rate
 
-		# If audio is > 10 minutes long, use the ffmpeg versions
-		if audio_signal.signal_duration >= 10 * 60 * 60:
-			resample_fn = audio_signal.ffmpeg_resample
-			loudness_fn = audio_signal.ffmpeg_loudness
+# 		resample_fn = audio_signal.resample
+# 		loudness_fn = audio_signal.loudness
 
-		original_length = audio_signal.signal_length
-		resample_fn(self.sample_rate)
-		input_db = loudness_fn()
+# 		# If audio is > 10 minutes long, use the ffmpeg versions
+# 		if audio_signal.signal_duration >= 10 * 60 * 60:
+# 			resample_fn = audio_signal.ffmpeg_resample
+# 			loudness_fn = audio_signal.ffmpeg_loudness
 
-		if normalize_db is not None:
-			audio_signal.normalize(normalize_db)
-		audio_signal.ensure_max_of_audio()
+# 		original_length = audio_signal.signal_length
+# 		resample_fn(self.sample_rate)
+# 		input_db = loudness_fn()
 
-		nb, nac, nt = audio_signal.audio_data.shape
-		audio_signal.audio_data = audio_signal.audio_data.reshape(nb * nac, 1, nt)
-		win_duration = (
-			audio_signal.signal_duration if win_duration is None else win_duration
-		)
+# 		if normalize_db is not None:
+# 			audio_signal.normalize(normalize_db)
+# 		audio_signal.ensure_max_of_audio()
 
-		if audio_signal.signal_duration <= win_duration:
-			# Unchunked compression (used if signal length < win duration)
-			self.padding = True
-			n_samples = nt
-			hop = nt
-		else:
-			# Chunked inference
-			self.padding = False
-			# Zero-pad signal on either side by the delay
-			audio_signal.zero_pad(self.delay, self.delay)
-			n_samples = int(win_duration * self.sample_rate)
-			# Round n_samples to nearest hop length multiple
-			n_samples = int(math.ceil(n_samples / self.hop_length) * self.hop_length)
-			hop = self.get_output_length(n_samples)
+# 		nb, nac, nt = audio_signal.audio_data.shape
+# 		audio_signal.audio_data = audio_signal.audio_data.reshape(nb * nac, 1, nt)
+# 		win_duration = (
+# 			audio_signal.signal_duration if win_duration is None else win_duration
+# 		)
 
-		codes = []
-		range_fn = range if not verbose else tqdm.trange
+# 		if audio_signal.signal_duration <= win_duration:
+# 			# Unchunked compression (used if signal length < win duration)
+# 			self.padding = True
+# 			n_samples = nt
+# 			hop = nt
+# 		else:
+# 			# Chunked inference
+# 			self.padding = False
+# 			# Zero-pad signal on either side by the delay
+# 			audio_signal.zero_pad(self.delay, self.delay)
+# 			n_samples = int(win_duration * self.sample_rate)
+# 			# Round n_samples to nearest hop length multiple
+# 			n_samples = int(math.ceil(n_samples / self.hop_length) * self.hop_length)
+# 			hop = self.get_output_length(n_samples)
 
-		for i in range_fn(0, nt, hop):
-			x = audio_signal[..., i : i + n_samples]
-			x = x.zero_pad(0, max(0, n_samples - x.shape[-1]))
+# 		codes = []
+# 		range_fn = range if not verbose else tqdm.trange
 
-			audio_data = x.audio_data.to(self.device)
-			audio_data = self.preprocess(audio_data, self.sample_rate)
-			with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
-				_, c, _, _, _ = self.encode(audio_data, n_quantizers)
-			codes.append(c.to(original_device))
-			chunk_length = c.shape[-1]
+# 		for i in range_fn(0, nt, hop):
+# 			x = audio_signal[..., i : i + n_samples]
+# 			x = x.zero_pad(0, max(0, n_samples - x.shape[-1]))
 
-		codes = torch.cat(codes, dim=-1)
+# 			audio_data = x.audio_data.to(self.device)
+# 			audio_data = self.preprocess(audio_data, self.sample_rate)
+# 			with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+# 				_, c, _, _, _ = self.encode(audio_data, n_quantizers)
+# 			codes.append(c.to(original_device))
+# 			chunk_length = c.shape[-1]
 
-		dac_file = DACFile(
-			codes=codes,
-			chunk_length=chunk_length,
-			original_length=original_length,
-			input_db=input_db,
-			channels=nac,
-			sample_rate=original_sr,
-			padding=self.padding,
-			dac_version="1.0.0",
-			#dac_version=SUPPORTED_VERSIONS[-1],
-		)
+# 		codes = torch.cat(codes, dim=-1)
 
-		if n_quantizers is not None:
-			codes = codes[:, :n_quantizers, :]
+# 		dac_file = DACFile(
+# 			codes=codes,
+# 			chunk_length=chunk_length,
+# 			original_length=original_length,
+# 			input_db=input_db,
+# 			channels=nac,
+# 			sample_rate=original_sr,
+# 			padding=self.padding,
+# 			dac_version="1.0.0",
+# 			#dac_version=SUPPORTED_VERSIONS[-1],
+# 		)
 
-		self.padding = original_padding
-		return dac_file
+# 		if n_quantizers is not None:
+# 			codes = codes[:, :n_quantizers, :]
 
-	@torch.no_grad()
-	def CodecMixin_decompress(
-		self,
-		obj: Union[str, Path, DACFile],
-		verbose: bool = False,
-	) -> AudioSignal:
-		self.eval()
-		if isinstance(obj, (str, Path)):
-			obj = DACFile.load(obj)
+# 		self.padding = original_padding
+# 		return dac_file
 
-		original_padding = self.padding
-		self.padding = obj.padding
+# 	@torch.no_grad()
+# 	def CodecMixin_decompress(
+# 		self,
+# 		obj: Union[str, Path, DACFile],
+# 		verbose: bool = False,
+# 	) -> AudioSignal:
+# 		self.eval()
+# 		if isinstance(obj, (str, Path)):
+# 			obj = DACFile.load(obj)
 
-		range_fn = range if not verbose else tqdm.trange
-		codes = obj.codes
-		original_device = codes.device
-		chunk_length = obj.chunk_length
-		recons = []
+# 		original_padding = self.padding
+# 		self.padding = obj.padding
 
-		for i in range_fn(0, codes.shape[-1], chunk_length):
-			c = codes[..., i : i + chunk_length].to(self.device)
-			z = self.quantizer.from_codes(c)[0]
-			r = self.decode(z)
-			recons.append(r.to(original_device))
+# 		range_fn = range if not verbose else tqdm.trange
+# 		codes = obj.codes
+# 		original_device = codes.device
+# 		chunk_length = obj.chunk_length
+# 		recons = []
 
-		recons = torch.cat(recons, dim=-1)
-		recons = AudioSignal(recons, self.sample_rate)
+# 		for i in range_fn(0, codes.shape[-1], chunk_length):
+# 			c = codes[..., i : i + chunk_length].to(self.device)
+# 			z = self.quantizer.from_codes(c)[0]
+# 			r = self.decode(z)
+# 			recons.append(r.to(original_device))
 
-		# to-do, original implementation
-		if not hasattr(obj, "dummy") or not obj.dummy:
-			resample_fn = recons.resample
-			loudness_fn = recons.loudness
+# 		recons = torch.cat(recons, dim=-1)
+# 		recons = AudioSignal(recons, self.sample_rate)
+
+# 		# to-do, original implementation
+# 		if not hasattr(obj, "dummy") or not obj.dummy:
+# 			resample_fn = recons.resample
+# 			loudness_fn = recons.loudness
 			
-			# If audio is > 10 minutes long, use the ffmpeg versions
-			if recons.signal_duration >= 10 * 60 * 60:
-				resample_fn = recons.ffmpeg_resample
-				loudness_fn = recons.ffmpeg_loudness
+# 			# If audio is > 10 minutes long, use the ffmpeg versions
+# 			if recons.signal_duration >= 10 * 60 * 60:
+# 				resample_fn = recons.ffmpeg_resample
+# 				loudness_fn = recons.ffmpeg_loudness
 
-			recons.normalize(obj.input_db)
-			resample_fn(obj.sample_rate)
-			recons = recons[..., : obj.original_length]
-			loudness_fn()
-			recons.audio_data = recons.audio_data.reshape(
-				-1, obj.channels, obj.original_length
-			)
-		self.padding = original_padding
-		return recons
+# 			recons.normalize(obj.input_db)
+# 			resample_fn(obj.sample_rate)
+# 			recons = recons[..., : obj.original_length]
+# 			loudness_fn()
+# 			recons.audio_data = recons.audio_data.reshape(
+# 				-1, obj.channels, obj.original_length
+# 			)
+# 		self.padding = original_padding
+# 		return recons
 
-	CodecMixin.compress = CodecMixin_compress
-	CodecMixin.decompress = CodecMixin_decompress
+# 	CodecMixin.compress = CodecMixin_compress
+# 	CodecMixin.decompress = CodecMixin_decompress
 
-except Exception as e:
-	cfg.inference.use_dac = False
-	_logger.warning(str(e))
+# except Exception as e:
+# 	cfg.inference.use_dac = False
+# 	_logger.warning(str(e))
 
 # uses https://github.com/facebookresearch/AudioDec/
 # I have set up a pip-ify'd version with the caveat of having to manually handle downloading the checkpoints with a wget + unzip
@@ -279,42 +281,43 @@ def _load_vocos_model(device="cuda", levels=0):
 
 	return model
 
-@cache
-def _load_dac_model(device="cuda"):
-	kwargs = dict(model_type="44khz",model_bitrate="8kbps",tag="latest")
-	# yes there's a better way, something like f'{cfg.sample.rate//1000}hz'		
-	if cfg.sample_rate == 44_100:
-		kwargs["model_type"] = "44khz"
-	elif cfg.sample_rate == 16_000:
-		kwargs["model_type"] = "16khz"
-	else:
-		raise Exception(f'unsupported sample rate: {cfg.sample_rate}')
+# @cache
+# def _load_dac_model(device="cuda"):
+# 	kwargs = dict(model_type="44khz",model_bitrate="8kbps",tag="latest")
+# 	# yes there's a better way, something like f'{cfg.sample.rate//1000}hz'		
+# 	if cfg.sample_rate == 44_100:
+# 		kwargs["model_type"] = "44khz"
+# 	elif cfg.sample_rate == 16_000:
+# 		kwargs["model_type"] = "16khz"
+# 	else:
+# 		raise Exception(f'unsupported sample rate: {cfg.sample_rate}')
 
-	model = __load_dac_model(**kwargs)
-	model = model.to(device)
-	model = model.eval()
+# 	model = __load_dac_model(**kwargs)
+# 	model = model.to(device)
+# 	model = model.eval()
 
-	model.backend = "dac"
-	model.model_type = kwargs["model_type"]
-	#model.device = device
+# 	model.backend = "dac"
+# 	model.model_type = kwargs["model_type"]
+# 	#model.device = device
 
-	return model
+# 	return model
 
 @cache
 def _load_audiodec_model(device="cuda", model_name=None):
-	if not model_name:
-		model_name = "libritts_v1" if cfg.sample_rate == 24_000 else "vctk_v1"
-	sample_rate, encoder_checkpoint, decoder_checkpoint = _audiodec_assign_model(model_name)
+	# if not model_name:
+	# 	model_name = "libritts_v1" if cfg.sample_rate == 24_000 else "vctk_v1"
+	# sample_rate, encoder_checkpoint, decoder_checkpoint = _audiodec_assign_model(model_name)
 
-	model = AudioDec(tx_device=device , rx_device=device )
-	model.load_transmitter(encoder_checkpoint)
-	model.load_receiver(encoder_checkpoint, decoder_checkpoint)
+	# model = AudioDec(tx_device=device , rx_device=device )
+	# model.load_transmitter(encoder_checkpoint)
+	# model.load_receiver(encoder_checkpoint, decoder_checkpoint)
 
-	model.backend = "audiodec"
-	model.sample_rate = sample_rate
-	model.device = device
+	# model.backend = "audiodec"
+	# model.sample_rate = sample_rate
+	# model.device = device
 
-	return model
+	# return model
+	sys.exit("audiodec is not supported in this version")
 
 @cache
 def _load_model(device="cuda", backend=None):
@@ -324,7 +327,8 @@ def _load_model(device="cuda", backend=None):
 	if backend == "audiodec":
 		return _load_audiodec_model(device)
 	if backend == "dac":
-		return _load_dac_model(device)
+		#return _load_dac_model(device)
+		sys.exit("dac is not supported in this version")
 	if backend == "vocos":
 		return _load_vocos_model(device)
 
@@ -363,36 +367,37 @@ def decode(codes: Tensor, device="cuda", metadata=None, window_duration=None):
 
 	# DAC uses a different pathway
 	if model.backend == "dac":
-		dummy = False
-		if metadata is None:
-			metadata = dict(
-				chunk_length=codes.shape[-1],
-				original_length=0,
-				input_db=-12,
-				channels=1,
-				sample_rate=model.sample_rate,
-				padding=True,
-				dac_version='1.0.0',
-			)
-			dummy = True
-		elif hasattr( metadata, "__dict__" ):
-			metadata = metadata.__dict__
+		sys.exit("dac is not supported in this version")
+		# dummy = False
+		# if metadata is None:
+		# 	metadata = dict(
+		# 		chunk_length=codes.shape[-1],
+		# 		original_length=0,
+		# 		input_db=-12,
+		# 		channels=1,
+		# 		sample_rate=model.sample_rate,
+		# 		padding=True,
+		# 		dac_version='1.0.0',
+		# 	)
+		# 	dummy = True
+		# elif hasattr( metadata, "__dict__" ):
+		# 	metadata = metadata.__dict__
 
-		# generate object with copied metadata
-		artifact = DACFile(
-			codes = codes,
-			chunk_length = math.floor(window_duration * cfg.dataset.frames_per_second) if window_duration else metadata["chunk_length"],
-			original_length = metadata["original_length"],
-			input_db = metadata["input_db"],
-			channels = metadata["channels"],
-			sample_rate = metadata["sample_rate"],
-			padding = metadata["padding"],
-			dac_version = metadata["dac_version"],
-		)
-		artifact.dummy = dummy
+		# # generate object with copied metadata
+		# artifact = DACFile(
+		# 	codes = codes,
+		# 	chunk_length = math.floor(window_duration * cfg.dataset.frames_per_second) if window_duration else metadata["chunk_length"],
+		# 	original_length = metadata["original_length"],
+		# 	input_db = metadata["input_db"],
+		# 	channels = metadata["channels"],
+		# 	sample_rate = metadata["sample_rate"],
+		# 	padding = metadata["padding"],
+		# 	dac_version = metadata["dac_version"],
+		# )
+		# artifact.dummy = dummy
 
-		# to-do: inject the sample rate encoded at, because we can actually decouple		
-		return CodecMixin_decompress(model, artifact, verbose=False).audio_data[0], artifact.sample_rate
+		# # to-do: inject the sample rate encoded at, because we can actually decouple		
+		# return CodecMixin_decompress(model, artifact, verbose=False).audio_data[0], artifact.sample_rate
 
 	kwargs = {}
 	if model.backend == "vocos":
@@ -485,28 +490,30 @@ def encode_as_embedding(codes: Tensor, quant_level: int = 0, sums=False, device=
 def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", return_metadata=True, window_duration=None):
 	# DAC uses a different pathway
 	if cfg.audio_backend == "dac":
-		model = _load_dac_model( device )
-		signal = AudioSignal(wav, sample_rate=sr)
+		# model = _load_dac_model( device )
+		# signal = AudioSignal(wav, sample_rate=sr)
 		
-		artifact = model.compress(signal, win_duration=window_duration, verbose=False) # , n_quantizers=levels)
-		#artifact = model.compress(signal)
-		return artifact.codes if not return_metadata else artifact
+		# artifact = model.compress(signal, win_duration=window_duration, verbose=False) # , n_quantizers=levels)
+		# #artifact = model.compress(signal)
+		# return artifact.codes if not return_metadata else artifact
+		sys.exit("dac is not supported in this version")
 
 	# AudioDec uses a different pathway
 	if cfg.audio_backend == "audiodec":
-		model = _load_audiodec_model(device)
-		# reshape (channel, samples) => (batch, channel, samples)
-		if wav.dim() < 3:
-			wav = wav.unsqueeze(0)
-		# skip unnecessary resample
-		if sr != model.sample_rate or wav.shape[1] != 1:
-			wav = convert_audio(wav, sr, model.sample_rate, 1)
-		wav = wav.to(device)
+		# model = _load_audiodec_model(device)
+		# # reshape (channel, samples) => (batch, channel, samples)
+		# if wav.dim() < 3:
+		# 	wav = wav.unsqueeze(0)
+		# # skip unnecessary resample
+		# if sr != model.sample_rate or wav.shape[1] != 1:
+		# 	wav = convert_audio(wav, sr, model.sample_rate, 1)
+		# wav = wav.to(device)
 
-		# wav = rearrange(wav, "t c -> t 1 c").to(device)
-		encoded = model.tx_encoder.encode(wav)
-		quantized = model.tx_encoder.quantize(encoded)
-		return quantized
+		# # wav = rearrange(wav, "t c -> t 1 c").to(device)
+		# encoded = model.tx_encoder.encode(wav)
+		# quantized = model.tx_encoder.quantize(encoded)
+		# return quantized
+		sys.exit("audiodec is not supported in this version")
 
 	# vocos does not encode wavs to encodecs, so just use normal encodec
 	model = _load_encodec_model(device)

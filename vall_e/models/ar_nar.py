@@ -74,8 +74,8 @@ class AR_NAR(Base):
 		# RVQ levels to apply token dropout on
 		token_dropout_rvq_levels = self.config.experimental.token_dropout_rvq_levels
 		# RVQ levels to apply masking training on
-		masking_train_rvq_levels = self.config.experimental.masking_train_rvq_levels
-		# CFG
+		masking_train_rvq_levels = self.config.experimental.masking_train_rvq_levels  ## always [0,0] for now, for the first level of pure-NAR!!!!
+		# CFG (classifier-free guidance?)
 		cfg_text_dropout_p = self.config.experimental.cfg_text_dropout_p if self.config is not None else 0.0
 		cfg_cond_dropout_p = self.config.experimental.cfg_cond_dropout_p if self.config is not None else 0.0
 		cfg_prom_dropout_p = self.config.experimental.cfg_prom_dropout_p if self.config is not None else 0.0
@@ -107,11 +107,11 @@ class AR_NAR(Base):
 
 		# input RVQ levels
 		quant_levels = [ random.choice( rvq_levels_p ) for i in range(batch_size) ]
-		# timestep levels (for TTS NAR)
+		# timestep levels (for TTS NAR) -- mask schedual?
 		timesteps = [ None for _ in range(batch_size) ]
 
 		for i, task in enumerate( task_list ):
-			lo, hi = masking_train_rvq_levels[0], masking_train_rvq_levels[1]
+			lo, hi = masking_train_rvq_levels[0], masking_train_rvq_levels[1] ## usually [0,0], only on level 0
 			if task in text_task:
 				quant_levels[i] = 0 # self.n_resp_levels - 1
 			elif lo <= quant_levels[i] and quant_levels[i] <= hi and random.random() < masking_train_p:
@@ -216,6 +216,7 @@ class AR_NAR(Base):
 			quant_levels=quant_levels,
 		)
 
+	## used for resemble diffusion?
 	def forward_nar_masked(
 		self,
 
@@ -237,7 +238,7 @@ class AR_NAR(Base):
 		device = text_list[0].device
 		batch_size = len(text_list)
 
-		level = 0
+		level = 0  ## can be used for other levels too?
 		if cfg.lora is not None:
 			enable_lora( self, cfg.lora.active_level( level ) if use_lora is None else use_lora )
 
@@ -270,7 +271,7 @@ class AR_NAR(Base):
 		start_noise = sampling_kwargs.get("denoise_start", 0.0)
 		end_noise = sampling_kwargs.get("denoise_end", 1.0)
 		remasking = sampling_kwargs.get("remasking", True)
-		max_steps = math.floor(max_steps * (end_noise - start_noise))
+		max_steps = math.floor(max_steps * (end_noise - start_noise)) ### when not fully 0->1?
 
 		# to specify the initial mask used
 		vc_list = sampling_kwargs.pop("vc_list", None)
@@ -316,8 +317,8 @@ class AR_NAR(Base):
 			prev_list = resps_list
 			# ramp down over time
 			annealing = 1.0 - timestep
-			# get noise level, per cosine scheduling
-			noise_p = math.cos( timestep * math.pi * 0.5 )
+			# get noise level, per cosine scheduling   
+			noise_p = math.cos( timestep * math.pi * 0.5 )  ##warning, in base model, if config.masking_ratio = 0.8. then in training stage, always mask 0.8, but sampling stil follow the noise defined here !!!!!
 			# proportion of tokens to remask
 			remask_p = 1.0 / (max_steps * 2) if remasking else 0
 			# pick the worst scoring tokens to mask off
@@ -325,7 +326,7 @@ class AR_NAR(Base):
 			# normal masking
 			if vc_list is None or timestep >= vc_threshold:
 				# mask off inputs
-				resps_list = [ resp.scatter(0, indices, self.stop_token) for resp, indices in zip( resps_list, masked_indices ) ]
+				resps_list = [ resp.scatter(0, indices, self.stop_token) for resp, indices in zip( resps_list, masked_indices ) ]  ### why stop_token here, not "0" as done in the base-model forward call for batch processing ? Isn't the stop_token is for AR?
 				# boolean mask
 				is_masked = [ resps == self.stop_token for resps in resps_list ]
 			else:
@@ -430,6 +431,7 @@ class AR_NAR(Base):
 
 		return resps_list
 
+	### normal nar?
 	def forward_nar(
 		self,
 		task_list: list[Tensor] | None = None,
@@ -510,7 +512,7 @@ class AR_NAR(Base):
 			inputs = self.inputs(
 				text_list=text_list,
 				proms_list=proms_list,
-				resps_list=prev_list,
+				resps_list=prev_list,  ### it is a BXTXL Tensor 0<L<8, codeword not embeddings! 
 				lang_list=lang_list,
 				tone_list=tone_list,
 				quant_levels=quant_levels,
@@ -535,7 +537,7 @@ class AR_NAR(Base):
 					inputs=null_inputs,
 					quant_levels=quant_levels,
 				)
-
+				## rememebered in probAI, CFG = conditional + scale * unconditional(null_input)
 				logits = cfg_logits( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ resp.shape[0] for resp in resps_list ] )
 
 			sampled = super().sample(
@@ -546,10 +548,12 @@ class AR_NAR(Base):
 			)
 
 			resps_list = sampled.ids
+			## always concate, because next step need all the preivious code-levels for embeddings ! different from original
 			prev_list = [ torch.cat([rs, r.unsqueeze(-1).to(device=device)], dim=-1) for rs, r in zip(prev_list, resps_list) ]
 
 		return prev_list
 
+	### can be used for predicting len for NAR or AR for level 0, can be used for other levels as well
 	def forward_ar(
 		self,
 
@@ -610,7 +614,7 @@ class AR_NAR(Base):
 			task_list = [ "len" for _ in range(batch_size) ]
 			quant_levels = [ 0 for _ in range( max( batch_size, beam_width ) ) ]
 
-			iterator = trange(10, desc="AR", disable=disable_tqdm)
+			iterator = trange(10, desc="AR", disable=disable_tqdm)  ## at most length = 99999999? AR-attention generates each time step one token 
 			for n in iterator:
 				len_list = sequence_list
 
@@ -630,18 +634,18 @@ class AR_NAR(Base):
 				)
 
 				output = super().forward(
-					inputs=inputs,
-					quant_levels=quant_levels,
+					inputs=inputs, 
+					quant_levels=quant_levels,  ### every call to forward can generate logits for only one level, important!
 				)
-				logits = output.logits
+				logits = output.logits #(b,t,v)  
 
-				r = [ logit[-1:].argmax(dim=1) for logit in logits ]
+				r = [ logit[-1:].argmax(dim=1) for logit in logits ]  ### forward() will remove the logits for padding-masking and causal-masking,so the last one is the newly generated token
 				# sanitize
 				for i, token in enumerate(r):
-					if token > stop_token:
+					if token > stop_token:  ## for task "len", only 0-9 is valid?
 						r[i][0] = stop_token
 
-				# append tokens
+				# append tokens -- so the input is the expanded and move to the next step
 				for i, ri in enumerate(r):
 					if stop_token in ri:
 						stopped[i] = True
@@ -889,13 +893,14 @@ class AR_NAR(Base):
 
 		# implicitly set for training
 		if training is None and text_list is not None and resps_list is not None:
-			n_levels_set = {r.shape[-1] for r in resps_list}
+			n_levels_set = {r.shape[-1] for r in resps_list} 
 			n_levels = next(iter(n_levels_set))
 
-			training = n_levels == self.n_resp_levels
+			training = n_levels == self.n_resp_levels  ## if resp is full, nothing to predict, then it's for training for sure? 
 
-		# is training
-		if training:
+		### for training, the dataloader/dataset will sample the tasks to train len/nar/ar...., not sure if multiple tasks are allowed for a singel batch?
+		### For level 0, Masked NAR / normal NAR training is controled by config, for other levels AR/NAR is controled by using masking for "causal" attention? 
+		if training:   
 			return self.forward_train(
 				task_list=task_list,
 				
@@ -909,7 +914,7 @@ class AR_NAR(Base):
 				raw_text_list=raw_text_list,
 			)
 
-		# is NAR
+		# is NAR -- no garantee of having NAR as the first q_level?
 		if (len_list is not None or resps_list is not None) and text_list is not None:
 			return self.forward_nar(
 				task_list=task_list,
@@ -983,8 +988,8 @@ def example_usage():
 	batch_size = cfg.hyperparameters.batch_size
 
 	text_list = [ text ] * batch_size
-	proms_list = [ audio[:cfg.dataset.frames_per_second, :] ] * batch_size
-	resps_list = [ audio[:cfg.dataset.frames_per_second * 4, :] ] * batch_size
+	proms_list = [ audio[:cfg.dataset.frames_per_second, :] ] * batch_size   ## 1 sec prompt only?
+	resps_list = [ audio[:cfg.dataset.frames_per_second * 4, :] ] * batch_size ## 3 sec reps as label?
 
 	kwargs = {
 		'n_text_tokens': 256,
@@ -1127,7 +1132,8 @@ def example_usage():
 		resps = []
 		tasks = []
 
-		for i in range(batch_size):
+		## else single batch, sample from possible tasks as well,usually for training, can for inference as well?
+		for i in range(s): ##batch_size=1 here
 			task = random.choice(available_tasks) if t is None else t
 
 			text = text_list[i].to(cfg.device)
@@ -1138,7 +1144,7 @@ def example_usage():
 			if task == "stt":
 				prom = [ task ]
 			else:
-				task = "tts" if random.random() > 0.1 or "len" not in cfg.model.capabilities else "len"
+				task = "tts" if random.random() > 0.1 or "len" not in cfg.model.capabilities else "len" ## train len preidictor for 10% of the chance?
 
 			texts.append( text )
 			proms.append( prom )
@@ -1149,17 +1155,17 @@ def example_usage():
 
 	@torch.inference_mode()
 	def sample( name, steps=500, task=None ):
-		engine.eval()
+		engine.eval() ## it does not affect model.training=false by default?
 
 		text_list, proms_list, resp_list, task_list = sample_data( task )
 
-		if task == "tts-nar":
-			len_list = engine( text_list=text_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 )
-			len_list = [ resp_list[0].shape[0] for l in len_list ]
-			resps_list = engine( text_list=text_list, proms_list=proms_list, len_list=len_list )
-		else:
-			resps_list = engine( text_list=text_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )
-			resps_list = engine( text_list=text_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 )
+		if task == "tts-nar": # call to forward_ar generate only one reps-level, call to forward_nar, generate for all levels?
+			len_list = engine( text_list=text_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 ) ## call to forward_ar for len
+			len_list = [ resp_list[0].shape[0] for l in len_list ] ## what? why don't use the predicted len_list? for training here?
+			resps_list = engine( text_list=text_list, proms_list=proms_list, len_list=len_list ) ##call to forward-nar automatically once provided with len_list
+		else: ## tts-ar, normal ar+nar ? 
+			resps_list = engine( text_list=text_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )  ## call to forward_ar
+			resps_list = engine( text_list=text_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 ) # call to forward_nar but not for level 0 without len_list
 
 		for i, o in enumerate(resps_list):
 			_ = decode_to_file(o.to(dtype=torch.int32), f"data/{cfg.model.arch_type}.{cfg.audio_backend}.{i}.{name}.{task}.wav", device=cfg.device)

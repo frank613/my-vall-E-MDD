@@ -208,6 +208,9 @@ def process(
 
 				waveform, sample_rate = None, None
 				language = language_map[group_name] if group_name in language_map else (metadata[filename]["language"] if "language" in metadata[filename] else "en")
+				##hot fix for MDD
+				if not language:
+					language = "en"
 
 				if len(metadata[filename]["segments"]) == 0 or not use_slices:
 					outpath = Path(f'./{output_dataset}/{group_name}/{speaker_id}/{fname}.{extension}').with_suffix(audio_extension)
