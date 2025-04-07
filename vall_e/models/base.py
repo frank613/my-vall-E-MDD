@@ -249,7 +249,7 @@ class AudioEmbedding(nn.Module):
 			offset -= quant_level # offset by quant level since it'll iterate up that many levels
 		
 		if self.sums and quant_level > 0:
-			x = sum( [ self.embeddings[k + offset]( xi[:, k] ) for k in range( quant_level ) ] )
+			x = sum( [ self.embeddings[k + offset]( xi[:, k] ) for k in range( quant_level + 1) ] )
 		else:
 			k = quant_level
 			x = self.embeddings[k + offset]( xi if xi.dim() == 1 else xi[:, k] )
@@ -1248,7 +1248,7 @@ class Base(nn.Module):
 								quant_level = 0 if quant_level == 0 else quant_level - 1, # input is one below the target quant level
 							)
 							"""
-
+							## by defult it will sum inside the embdding call!!!
 							embedding = self.resps_emb(
 								input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level],
 								#offset = 0 if classifier_level.startswith("AR:") else 1,

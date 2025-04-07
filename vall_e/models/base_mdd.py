@@ -50,7 +50,7 @@ from ..utils.pattern import DelayedPatternProvider, VALLEPattern
 
 summed_embeddings_task = [ "stt" ]
 special_tasks = [ "len", "stt", "phn", "un-phn" ]
-non_tokened_names = ["task", "dropout_mask", "classifier_level", "mdd_mask", "masking_nar_level_0"]
+non_tokened_names = ["task", "dropout_mask", "classifier_level", "mdd_mask", "masking_resp_mdd","compute_mdd"]
 task_outputs = {
 	"tts": "resp",
 	"ns": "resp",
@@ -257,7 +257,7 @@ class AudioEmbedding(nn.Module):
 			offset -= quant_level # offset by quant level since it'll iterate up that many levels
 		
 		if self.sums and quant_level > 0:
-			x = sum( [ self.embeddings[k + offset]( xi[:, k] ) for k in range( quant_level ) ] )
+			x = sum( [ self.embeddings[k + offset]( xi[:, k] ) for k in range( quant_level + 1 ) ] )
 		else:
 			k = quant_level
 			x = self.embeddings[k + offset]( xi if xi.dim() == 1 else xi[:, k] )
@@ -914,9 +914,8 @@ class Base(nn.Module):
 		time_list: list[Tensor] | None = None,
 		pid_seq: list[list] | None = None,
   		is_nar_level_0: bool | None = None,
-		masking_nar_level_0: bool | None = None,
-
-
+		masking_resp_mdd: bool | None = None,
+		compute_mdd: bool | None = None,
 		quant_levels: int | list[int] | Tensor | None = None
 	):
 		if text_list and text_list[0] is not None:
@@ -933,7 +932,8 @@ class Base(nn.Module):
 			batch_size = len(resps_list)
 
 		inputs = [ [] for _ in range(batch_size) ]
-		assert len(inputs) == len(pid_seq)
+		if pid_seq is not None:
+			assert len(inputs) == len(pid_seq)
 		for i in range(batch_size):
 			quant_level = quant_levels[i] if quant_levels is not None else 0
 			task_type = task_list[i] if task_list is not None else "tts"
@@ -960,9 +960,11 @@ class Base(nn.Module):
 					inputs[i].append( ( "lang", lang_list[i] ) )
 				# insert RVQ level guidance token if the model is versioned for it
 				if self.rvq_l_emb is not None and not self.interleave:
-					inputs[i].append( ( "quant_level", torch.tensor([ quant_level ], device=device, dtype=torch.int16) ) )
-
+					inputs[i].append( ( "quant_level", torch.tensor([ quant_level ], device=device, dtype=torch.int16) ))
 					classifier_level = "AR:0:0" if quant_level == 0 else f'NAR:{quant_level-1}:{quant_level}'
+				#In this MDD version, NAR:0:0 is controled by the flag is_nar_level_0
+				if is_nar_level_0 and quant_level == 0:
+					classifier_level = "NAR:0:0"
 				# insert input audio prompt
 				if proms_list is not None and proms_list[i] is not None:
 					inputs[i].append( ( "prom", proms_list[i] ) )
@@ -993,16 +995,14 @@ class Base(nn.Module):
 				# insert the current output response
 				if resps_list is not None and resps_list[i] is not None:
 					inputs[i].append( ( "resp", resps_list[i] ) )
-				### mdd masking
-				if pid_seq is None:
-					sys.exit("MDD must provide pid_seq as input")
-				else:
+				### mdd masking for gop
+				if pid_seq is not None:
 					mdd_mask = _mdd_mask(pid_seq, i, resps_list[i].shape[0], device)  ## mdd_mask must be provided, regardless of using mask or not
 					inputs[i].append( ("mdd_mask", mdd_mask ) )
-				if is_nar_level_0 and quant_level == 0:
-					classifier_level = "NAR:0:0"
-				if masking_nar_level_0:
-					inputs[i].append( ("masking_nar_level_0", masking_nar_level_0) )
+				if masking_resp_mdd is not None:
+					inputs[i].append( ("masking_resp_mdd", masking_resp_mdd) )
+				if compute_mdd is not None:
+					inputs[i].append( ("compute_mdd", compute_mdd) )
 				inputs[i].append( ("classifier_level", classifier_level) )
 			# Audio length prediction task
 			# Sequence: <text><sep><rvq lvl><prom><sep><len>
@@ -1172,6 +1172,11 @@ class Base(nn.Module):
 			classifier_level = None
 			dropout_mask = None
 			timestep = None
+			###mdd
+			mdd_mask = None
+			masking_resp_mdd = None  ##for MDD GOP, wether masking or not
+			phoneme_mask = None ##for masked generation
+			compute_mdd = None ##wether or not to compute GOP, generation/MDD? not used here, used in compute avg-posterior
 			
 			# pre-iterate
 			for name, input in batch_input:
@@ -1181,8 +1186,10 @@ class Base(nn.Module):
 					sys.exit("no dropout_mask for MDD")
 				elif name == "mdd_mask":
 					mdd_mask = input
-				elif name == "masking_nar_level_0":
-					masking_nar_level_0 = input
+				elif name == "masking_resp_mdd":
+					masking_resp_mdd = input
+				elif name == "compute_mdd":
+					compute_mdd = input
 				elif name == "timestep":
 					timestep = input
 
@@ -1238,57 +1245,55 @@ class Base(nn.Module):
 						# 	#quant_level = 0,
 						# 	name = classifier_level,
 						# )
-					# NAR-len at level 0, do mask here for MDD
+					# NAR-len at level 0, do mask here for MDD also masked generation
 					elif classifier_level == "NAR:0:0":
-						assert mdd_mask is not None
-						if masking_nar_level_0:
+						##mdd_mask for computing GOP or not compute_mdd for masked generation
+						assert mdd_mask is not None or compute_mdd == False 
+						if masking_resp_mdd:
 							embedding = self.resps_emb(
 								torch.where( mdd_mask, self.stop_token, input if input.dim() == 1 else input[:, 0]),
 								#quant_level = 0,
 								name = classifier_level,
 							)
 						else:
-							embedding = input if input.dim() == 1 else input[:, 0]
+							embedding = self.resps_emb(input if input.dim() == 1 else input[:, 0], name = classifier_level)
 					# cheat-y way to handle performing STT across all levels
-					elif task_type in summed_embeddings_task:
+					elif task_type in summed_embeddings_task: ## only stt task!!!
 						# we do a manual sum because I trained it to use the AR embeddings + NAR embeddings for STT......
 						embedding = sum([ self.resps_emb(
 							input[:, :l+1],
-							offset = 0 if l == 0 else 1, # or maybe set to 1
+							offset = 0 if l == 0 else 1, # or maybe set to 1  ## [0] if for AR:0:0, after it, NAR:0:1 ... !!!
 							quant_level = l,
 							#name = 'AR:0:0' if l == 0 else f'NAR:{l-1}:{l}',
 							sums = False
 						) for l in range( input.shape[-1] - 1 ) ])
 					else:
 						# get RVQ level 0, or up to targetted RVQ level inference
-						if self.version <= 4:
+						if self.version <= 4: ## this is concatanating all the code embeddings instead of summation?
 							embedding = self.resps_emb(
 								input if quant_level == 0 else input[:, :quant_level],
 								quant_level
 							)
 						else:
-							"""
-							offset = 0
-							if "nar" not in self.capabilities:
-								offset = 0
-							elif quant_level > 0:
-								offset = 1
 
-							embedding = self.resps_emb(
-								input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level],
-								offset = offset,
-								quant_level = 0 if quant_level == 0 else quant_level - 1, # input is one below the target quant level
-							)
-							"""
+							if not masking_resp_mdd:
+								#self.resps_emb(input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level], name = classifier_level, quant_level = 0 if quant_level == 0 else quant_level - 1
+								embedding = self.resps_emb(
+									input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level],
+									#offset = 0 if classifier_level.startswith("AR:") else 1,
+									name = classifier_level,
+									#why - 1??  quant_level [0,7], if to preidct q_l=7, then we have embeddings of 7(0-6) codes to sum 
+									quant_level = 0 if quant_level == 0 else quant_level - 1, 
+								)
+							else:
+								embedding = self.resps_emb(
+            						torch.where(mdd_mask[:,None].expand((mdd_mask.shape[0], quant_level)), self.stop_token, input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level]),
+									name = classifier_level,
+									quant_level = 0 if quant_level == 0 else quant_level - 1,
+								)
 
-							embedding = self.resps_emb(
-								input if input.dim() == 1 or quant_level == 0 else input[:, :quant_level],
-								#offset = 0 if classifier_level.startswith("AR:") else 1,
-								name = classifier_level,
-								quant_level = 0 if quant_level == 0 else quant_level - 1, # input is one below the target quant level
-							)
 
-						# apply token dropout
+						# apply token dropout ## in the model it is 0!!!
 						if token_dropout_rate > 0.0 and (token_dropout_rvq_levels[0] <= quant_level and quant_level <= token_dropout_rvq_levels[1]):
 							steps = embedding.shape[0] - (1 if quant_level == 0 else 0) # do not mess with stop token
 							for i in range( steps ):
@@ -1296,7 +1301,8 @@ class Base(nn.Module):
 									continue
 								
 								embedding[i] = self.dropout_token
-				elif name == "timestep" and self.time_emb is not None:
+				elif name == "timestep" and self.time_emb is not None: 
+					## the models uses fixed masking_ratio =0.8, so no time step emb is needed!!!
 					sys.exit("timestep should not be passed for MDD")
 				elif name == "len" and self.len_emb is not None:
 					embedding = self.len_emb( input )
@@ -1305,7 +1311,6 @@ class Base(nn.Module):
 					continue
 
 				batch.append(embedding)
-
 			x_list.append( _join( batch, self.sep ) )
 
 		return x_list
@@ -1372,7 +1377,6 @@ class Base(nn.Module):
 				for name, input in batch_input:
 					if name == "task":
 						task = input
-
 				batch = torch.cat( [
 					torch.tensor([*range(get_input_token_length(name, input, task) + (1 if name != task_outputs.get(task, name) else 0))], device=device, dtype=torch.int32)
 					for name, input in batch_input if name not in non_tokened_names
@@ -1407,6 +1411,8 @@ class Base(nn.Module):
 		for batch_index, batch in enumerate(inputs):
 			quant_level = quant_levels[batch_index]
 			causal = True
+			mdd_mask = None
+			compute_mdd = True
 			for name, input in batch:
 				if name == "task":
 					task_type = input
@@ -1416,12 +1422,17 @@ class Base(nn.Module):
 					mdd_mask = input
 				elif name == "classifier_level": 
 					classifier_level = input
+				elif name == "compute_mdd":
+					compute_mdd = input
+			if compute_mdd is False:
+				continue
 			if quant_level == 0 and mdd_mask is None:
 				sys.exit("for now must provide mdd_mask for quant_level=0")
 			if classifier_level.startswith("NAR:"):
 				causal = False
 			else:
-				sys.exit("for now only supporting NAR for non-causal MDD")
+				sys.exit("for now only supporting NAR for non-causal MDD/generation")
+    
 
 			it = 0
 			for name, input in batch:
@@ -1437,7 +1448,6 @@ class Base(nn.Module):
 					# iterate over the list to inject their tokens
 					token = torch.cat( [ prompt_input_to_token( input, quant_level ) for input in proms if input is not None ] )
 				elif name == "resp":
-					#pdb.set_trace()
 					if mdd_mask is None or self.interleave:
 						sys.exit("MDD must has a mdd_mask and non-interleave")
 					else:
@@ -1463,16 +1473,27 @@ class Base(nn.Module):
 				if name != task_outputs.get(task_type, name):
 					if self.ignore_inputs_for_loss:
 						ignored = True
-
+				
 				if ignored:
 					token = torch.tensor( [ self.ignore_index ] * token.shape[0], device=device, dtype=torch.int16)
 				
+				## for MDD, we only need once for each batch-item, so break after valid value being computed, need to check (checked)
 				if any(token != self.ignore_index):
-					cur_logit = logits[batch_index][start:end].softmax(dim=-1)
+					assert token.shape[0] == end - start
 					## compute the avg_posterior
-					index1 = torch.nonzero(token>0, as_tuple=True)[0].tolist()
-					index2 = token[token>0].tolist()
-					avg_posterior = cur_logit[index1, index2].mean()
+					## do mean than log 
+     				# cur_logit = logits[batch_index][start:end].softmax(dim=-1)
+					# index1 = torch.nonzero(token>=0, as_tuple=True)[0].tolist()
+					# index2 = token[token>0].tolist()
+     				# assert len(index1) == len(index2)
+					# avg_posterior = cur_logit[index1, index2].mean()
+					# avg_post_list.append(avg_posterior.item())
+					# do log first then mean
+					cur_logit = logits[batch_index][start:end]
+					index1 = torch.nonzero(token>=0, as_tuple=True)[0].tolist()
+					index2 = token[token>=0].tolist()
+					assert len(index1) == len(index2)
+					avg_posterior = (cur_logit - cur_logit.logsumexp(dim=-1, keepdim=True))[index1, index2].mean()
 					avg_post_list.append(avg_posterior.item())
 					break
 		return avg_post_list
@@ -1747,7 +1768,7 @@ class Base(nn.Module):
 
 		self.get_input( inputs, "quant_level" )
 		x_list = self.inputs_to_embeddings( inputs, quant_levels )
-		
+
 		x, mask = list_to_tensor(x_list) ### this is important for batch processing in the pytorch models? always pad 0?
 
 		### MDD marks training as False
@@ -1962,7 +1983,7 @@ class Base(nn.Module):
 
 		# (NAR) return the entire generated response
 		# Parallel decoding relies on the last N tokens in the logits, because each token predicts the next RVQ layer in the same place (forgetfully obviously)	
-		## transformer will generate the same number of tokens as input (prompts as well), only last L logtis are related to output???
+		## transformer will generate the same number of tokens as input (prompts as well), only last L logtis are related to output!!!
 		if quant_levels is not None: #  and "nar" in self.capabilities: # for when I get around to coping about dropping the NAR entirely
 			seq_lens = map(len, prev_list)
 			logits = [ logit[-l:] for logit, l in zip(logits, seq_lens) ]

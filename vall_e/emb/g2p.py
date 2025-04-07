@@ -10,6 +10,7 @@ from phonemizer import phonemize
 from phonemizer.backend import BACKENDS
 
 from tqdm import tqdm
+import pdb
 
 # try:
 # 	import pykakasi
