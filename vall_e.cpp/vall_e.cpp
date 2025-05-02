@@ -89,28 +89,7 @@ std::vector<float> read_2d_tensor( struct ggml_tensor* tensor ) {
 
 	return res;
 }
-/*
-ggml_tensor* view_2d_tensor( struct ggml_tensor* tensor, int32_t start, int32_t end, int32_t dim ) {
-	// to-do: implement other dim
-	if ( start < 0 ) start = tensor->ne[1] + start;
-	if ( end < 0 ) end = tensor->ne[1] + end;
-	
-	ggml_tensor* res = new ggml_tensor();
-	memcpy( res, tensor, sizeof(ggml_tensor) );
 
-	res->op     = GGML_OP_VIEW;
-	res->src[0] = tensor;
-
-	res->data   += res->nb[1] * start;
-	res->ne[1]  = end - start;
-
-	for (int i = 2; i < GGML_MAX_DIMS; i++) {
-		res->nb[i] = res->nb[i - 1] * res->ne[i - 1];
-	}
-
-	return res;
-}
-*/
 ggml_tensor* view_2d_tensor( struct ggml_context* ctx, struct ggml_tensor* tensor, int32_t start, int32_t end, int32_t dim ) {
 	// to-do: implement other dim
 	if ( start < 0 ) start = tensor->ne[1] + start;
@@ -128,6 +107,29 @@ void print_tokens( const std::vector<token_t>& tokens, const std::string& prefix
 	}
 	printf("]\n");
 }
+void print_floats( const std::vector<float>& v, const std::string& prefix ) {
+	printf("%s[", prefix.c_str());
+	for ( auto i = 0; i < v.size(); ++i ) {
+		printf("%f%s", v[i], i + 1 < v.size() ? ", " : "");
+	}
+	printf("]\n");
+}
+
+
+float calculate_std(const float* data, size_t n) {
+	float mean = 0.0f;
+	for (size_t i = 0; i < n; i++) mean += data[i];
+	mean /= n;
+
+	float variance = 0.0f;
+	for (size_t i = 0; i < n; i++) {
+		float diff = data[i] - mean;
+		variance += diff * diff;
+	}
+	variance /= n;
+
+	return sqrt(variance);
+}
 
 const io_t& vall_e_inputs_map_get( io_map_t& io_map, const std::string& name ) {
 	return io_map.io[name];
@@ -141,8 +143,9 @@ int32_t vall_e_inputs_map_get_classifier_idx( io_map_t& io_map, const std::strin
 }
 
 void vall_e_inputs_map_init( io_map_t& io_map, llama_model* model ) {
-	auto n_embd = llama_n_embd( model );
-	auto n_vocab = llama_n_vocab( model );
+	auto vocab = llama_model_get_vocab( model );
+	auto n_embd = llama_model_n_embd( model );
+	auto n_vocab = llama_vocab_n_tokens( vocab );
 	
 	io_map.n_embd = n_embd;
 	io_map.n_vocab = n_vocab;
@@ -362,32 +365,22 @@ std::vector<std::vector<float>> sum_embeddings( const std::vector<std::vector<to
 }
 
 std::vector<float> soft_max( int n_logits, const float* logits ) {
-	std::vector<float> res( n_logits, 0.0f );
-	std::vector<float> expd( n_logits, 0.0f );
+	std::vector<float> res(n_logits, 0.0f);
 	float denom = 0.0f;
 
-	for ( auto i = 0; i < n_logits; ++i ) {
-		expd[i] = expf( logits[i] );
-		denom += expd[i];
-	}
-	// to-do: assert denom != 0.0f
-	for ( auto i = 0; i < n_logits; ++i ) {
-		res[i] = expd[i] / denom;
+	float max_logit = logits[0];
+	for (int i = 1; i < n_logits; ++i) {
+		max_logit = std::max(max_logit, logits[i]);
 	}
 
-	return res;
-}
-
-std::vector<float> log_soft_max( int n_logits, const float* logits ) {
-	std::vector<float> res( n_logits, 0.0f );
-	float denom = 0.0f;
-
-	for ( auto i = 0; i < n_logits; ++i ) {
-		denom += logits[i];
+	for (int i = 0; i < n_logits; ++i) {
+		res[i] = std::exp(logits[i] - max_logit);
+		denom += res[i];
 	}
-	// to-do: assert denom != 0.0f
-	for ( auto i = 0; i < n_logits; ++i ) {
-		res[i] = logits[i] / denom;
+
+	float inv_denom = 1.0f / denom;
+	for (int i = 0; i < n_logits; ++i) {
+		res[i] *= inv_denom;
 	}
 
 	return res;
@@ -531,7 +524,7 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 	// to-do: figure this out......
 	{
 		llama_set_causal_attn( ctx->llama.ctx, causal ); // to-do: fix GGML_ASSERT(mask->ne[0] == a->ne[0])
-	//	*const_cast<bool*>(&model->hparams.causal_attn) = true; // force set this
+		*const_cast<bool*>(&ctx->llama.model->hparams.causal_attn) = true; // force set this
 	}
 
 	std::vector<token_t> output_tokens;
@@ -543,10 +536,14 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 		sparams.no_perf = false;
 		llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
-		llama_sampler_chain_add(smpl, llama_sampler_init_top_k(0));
-		llama_sampler_chain_add(smpl, llama_sampler_init_top_p(1.0, 1));
-		llama_sampler_chain_add(smpl, llama_sampler_init_temp (1.0));
-		llama_sampler_chain_add(smpl, llama_sampler_init_dist (LLAMA_DEFAULT_SEED));
+		if ( mode == INFERENCE_MODE_LEN ) {
+			llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+		} else {
+			llama_sampler_chain_add(smpl, llama_sampler_init_top_k(0));
+			llama_sampler_chain_add(smpl, llama_sampler_init_top_p(1.0, 1));
+			llama_sampler_chain_add(smpl, llama_sampler_init_temp (1.0));
+			llama_sampler_chain_add(smpl, llama_sampler_init_dist (LLAMA_DEFAULT_SEED));
+		}
 
 		output_tokens.reserve(max_tokens);
 		while ( output_tokens.size() < max_tokens ) {
@@ -554,7 +551,7 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 				fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
 				return output_tokens;
 			}
-			llama_kv_cache_clear(ctx->llama.ctx); // necessary for many reasons
+			llama_kv_self_clear(ctx->llama.ctx); // necessary for many reasons
 
 			// sample token
 			auto t = llama_sampler_sample(smpl, ctx->llama.ctx, -1);
@@ -577,11 +574,20 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 		// to-do: assert n_outputs == inputs.resp[rvq_l-1].size()
 		const token_t MASK_TOKEN = 1024; // token value for masking 
 		const float PI = 3.141592653589793f;
+		
 		// to-do: derive from sampling arguments
 		int32_t steps = max_tokens;
 		int32_t seq_len = n_outputs;
-		float temperature = 1.5f;
-		float cfg_strength = 2.5f;
+		int32_t top_k = 0;
+		float top_p = 1.0;
+		float temperature = 1.0f;
+		float cfg_strength = 3.0f;
+		float start_noise = 0.0f;
+		float end_noise = 1.0f;
+		bool annealed_sampling = true;
+		bool remasking = true;
+		float cfg_rescale = 0.75f;
+		bool entropy_scoring = true;
 
 		// fill with masked tokens
 		output_tokens.clear();
@@ -595,19 +601,21 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 		llama_batch null_batch = llama_batch_init( ctx->params.ctx_size, ctx->io_map->n_embd, ctx->params.ctx_size );
 		
 		// token scores to reference for masking
-		std::vector<float> scores(n_outputs, 1.0);
+		std::vector<float> scores(n_outputs, entropy_scoring ? 0.0 : 1.0);
 
 		// do one step on many tokens
 		for ( auto step = 0; step < steps; ++step ) {
-			float timestep = ((float)step) / steps; // to-do: align with torch.linspace
+			float t_norm = static_cast<float>(step) / static_cast<float>(steps - 1);
+			float timestep = start_noise + (end_noise - start_noise) * t_norm;
+			//float timestep = start_noise + (end_noise - start_noise) * ((float)step / steps);
 			
 			float annealing = 1.0f - timestep;
-			
-			float sampling_temperature = temperature * annealing;
-			float sampling_cfg_strength = timestep * cfg_strength;
+
+			float sampling_temperature = annealed_sampling ? temperature * annealing : temperature;
+			float sampling_cfg_strength = annealed_sampling ? timestep * cfg_strength : cfg_strength;
 
 			float noise_p = cos( timestep * PI * 0.5f );
-			float remask_p = 0.5f / steps;
+			float remask_p = remasking ? 1.0f / (steps * 2.0f) : 0.0f;
 			
 			int32_t n_masked_tokens = (noise_p + remask_p) * seq_len;
 			if ( n_masked_tokens < 1 ) {
@@ -623,7 +631,9 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 			std::vector<score_t> sorted_scores( n_outputs );
 			for ( auto i = 0; i < n_outputs; ++i ) sorted_scores[i] = { i, scores[i] };
 			std::sort(sorted_scores.begin(), sorted_scores.end());
-			std::reverse(sorted_scores.begin(), sorted_scores.end());
+			if ( entropy_scoring) {
+				std::reverse(sorted_scores.begin(), sorted_scores.end());
+			}
 			
 			// and top-k pick the worst scores
 			for ( auto i = 0; i < n_masked_tokens; ++i ) {
@@ -641,8 +651,8 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 			inputs.resp[0] = output_tokens;
 			fill_batch( batch, inputs, *ctx->io_map, mode );
 			// update null batch
-			null_input.resp[0] = output_tokens;
 			null_batch.n_tokens = 0;
+			null_input.resp[0] = output_tokens;
 			fill_batch( null_batch, inputs, *ctx->io_map, mode );
 
 			// cfg decode
@@ -650,7 +660,7 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 				fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
 				return output_tokens;
 			}
-			llama_kv_cache_clear(ctx->llama.ctx); // necessary for many reasons
+			llama_kv_self_clear(ctx->llama.ctx); // necessary for many reasons
 			// copy null probabilities
 			std::vector<float> null_logits(n_outputs * n_vocab, 0.0f);
 			memcpy( null_logits.data(), llama_get_logits( ctx->llama.ctx ), sizeof(float) * n_vocab * n_outputs );
@@ -660,21 +670,26 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 				fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
 				return output_tokens;
 			}
-			llama_kv_cache_clear(ctx->llama.ctx); // necessary for many reasons
+			llama_kv_self_clear(ctx->llama.ctx); // necessary for many reasons
 			
 			auto sparams = llama_sampler_chain_default_params();
 			sparams.no_perf = false;
 			llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
-			llama_sampler_chain_add(smpl, llama_sampler_init_top_k(20));
-			llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9, 1));
-			llama_sampler_chain_add(smpl, llama_sampler_init_temp (sampling_temperature));
-			llama_sampler_chain_add(smpl, llama_sampler_init_dist (LLAMA_DEFAULT_SEED));
+			if ( sampling_temperature == 0 ) {
+				llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+			} else {
+				llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+				llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+				llama_sampler_chain_add(smpl, llama_sampler_init_temp (sampling_temperature));
+				llama_sampler_chain_add(smpl, llama_sampler_init_dist (LLAMA_DEFAULT_SEED));
+			}
 
 			auto* logits = llama_get_logits( ctx->llama.ctx );
 			for ( auto idx = 0; idx < n_outputs; ++idx ) {
 				// skip if not masked
 				if ( !is_masked[idx] ) {
+					scores[idx] = entropy_scoring ? 0.0 : 1.0;
 					continue;
 				}
 
@@ -683,9 +698,23 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 
 				// perform softmax before modifying logits
 				std::vector<float> softmaxed = soft_max( n_vocab, logit );
+				int32_t t_u = std::distance( softmaxed.begin(), std::max_element(softmaxed.begin(), softmaxed.end()) );
 
-				for ( auto i = 0; i < n_vocab; ++i ) {
-					logit[i] = null_logit[i] + (logit[i] - null_logit[i]) * cfg_strength;
+				std::vector<float> summed(n_vocab);
+				for (int i = 0; i < n_vocab; i++) {
+					summed[i] = null_logit[i] + (logit[i] - null_logit[i]) * sampling_cfg_strength;
+				}
+
+				if (cfg_rescale > 0) {
+					float pos_std = calculate_std(logit, n_vocab);
+					float summed_std = calculate_std(summed.data(), n_vocab);
+					float factor = cfg_rescale * (pos_std / summed_std) + (1 - cfg_rescale);
+
+					for (int i = 0; i < n_vocab; i++) {
+						logit[i] = summed[i] * factor;
+					}
+				} else {
+					memcpy(logit, summed.data(), n_vocab * sizeof(float));
 				}
 
 				// sample ith token
@@ -693,7 +722,16 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 				// store token if it was masked
 				output_tokens[idx] = t;
 				// update score if it was masked
-				scores[idx] = 1.0f - softmaxed[t]; // invert so we pick the worst tokens later
+				if ( entropy_scoring ) {
+					float entropy = 0.f;
+					for (int v = 0; v < n_vocab; ++v ) {
+						float p = softmaxed[v];
+						if (p > 0) entropy -= p * std::log(p + 1e-9);
+					}
+					scores[idx] = entropy / std::log(n_vocab); // normalize [0–1]
+				} else {
+					scores[idx] = softmaxed[t_u]; // invert so we pick the worst tokens later
+				}
 			}
 
 			llama_sampler_free(smpl);
@@ -709,7 +747,7 @@ std::vector<token_t> generate( vall_e_context_t* ctx, vall_e_inputs_t& inputs, i
 			fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
 			return output_tokens;
 		}
-		llama_kv_cache_clear(ctx->llama.ctx); // necessary for many reasons
+		llama_kv_self_clear(ctx->llama.ctx); // necessary for many reasons
 
 		auto sparams = llama_sampler_chain_default_params();
 		sparams.no_perf = false;
@@ -816,39 +854,39 @@ std::vector<token_t> phonemize( vall_e_context_t* ctx, const std::string& text, 
 }
 
 void vall_e_print_usage( char** argv, vall_e_context_params_t& params, vall_e_args_t& args ) {
-    fprintf(stderr, "usage: %s [options]\n", argv[0]);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "options:\n");
-    fprintf(stderr, "  -h, --help                            Show this help message and exit\n");
-    fprintf(stderr, "  -t N, --threads N\n");
-    fprintf(stderr, "                                        Number of threads to use during computation (default: %d)\n", params.n_threads);
-    fprintf(stderr, "  -ngl N, --n-gpu-layers N\n");
-    fprintf(stderr, "                                        Number of layers to offload to the GPU (default: %d)\n", params.gpu_layers);
-    fprintf(stderr, "  -ctx N, --context-size N\n");
-    fprintf(stderr, "                                        Max context size (default: %d)\n", params.ctx_size);
-    fprintf(stderr, "  -v, --verbose\n");
-    fprintf(stderr, "                                        Verbose output (default: %d)\n", params.verbose);
-    fprintf(stderr, "  -m FNAME, --model FNAME\n");
-    fprintf(stderr, "                                        VALL-E model path (default: %s)\n", params.model_path.c_str());
-    fprintf(stderr, "  -em FNAME, --encodec-model FNAME\n");
-    fprintf(stderr, "                                        Encodec model path (default: %s)\n", params.encodec_path.c_str());
-    fprintf(stderr, "  -t TEXT, --text TEXT\n");
-    fprintf(stderr, "                                        Input text prompt (default: %s)\n", args.text.c_str());
-    fprintf(stderr, "  -l TEXT, --language TEXT\n");
-    fprintf(stderr, "                                        Language for input text / output response (default: %s)\n", args.language.c_str());
-    fprintf(stderr, "  -ts TASK, --task TASK\n");
-    fprintf(stderr, "                                        Inferencing task (default: %s, accepts ['tts', 'stt', 'ns', 'sr'])\n", args.task);
-    fprintf(stderr, "  -mode MODE, --modality MODE\n");
-    fprintf(stderr, "                                        Modality for inferencing (default: %s, accepts ['ar+nar', 'nar-len'])\n", args.modality == MODALITY_NAR_LEN ? "nar-len" : "ar+nar");
-    fprintf(stderr, "  -ms N, --max-steps N\n");
-    fprintf(stderr, "                                        Max steps for `nar-len` (default: %i)\n", args.max_steps);
-    fprintf(stderr, "  -md N, --max-duration N\n");
-    fprintf(stderr, "                                        Max duration of the audio (default: %i)\n", args.max_duration);
-    fprintf(stderr, "  -i FNAME, --input FNAME\n");
-    fprintf(stderr, "                                        Input prompt wav (default: %s)\n", args.prompt_path.c_str());
-    fprintf(stderr, "  -o FNAME, --output FNAME\n");
-    fprintf(stderr, "                                        Output audio wav (default: %s)\n", args.output_path.c_str());
-    fprintf(stderr, "\n");
+	fprintf(stderr, "usage: %s [options]\n", argv[0]);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "options:\n");
+	fprintf(stderr, "  -h, --help                            Show this help message and exit\n");
+	fprintf(stderr, "  -t N, --threads N\n");
+	fprintf(stderr, "                                        Number of threads to use during computation (default: %d)\n", params.n_threads);
+	fprintf(stderr, "  -ngl N, --n-gpu-layers N\n");
+	fprintf(stderr, "                                        Number of layers to offload to the GPU (default: %d)\n", params.gpu_layers);
+	fprintf(stderr, "  -ctx N, --context-size N\n");
+	fprintf(stderr, "                                        Max context size (default: %d)\n", params.ctx_size);
+	fprintf(stderr, "  -v, --verbose\n");
+	fprintf(stderr, "                                        Verbose output (default: %d)\n", params.verbose);
+	fprintf(stderr, "  -m FNAME, --model FNAME\n");
+	fprintf(stderr, "                                        VALL-E model path (default: %s)\n", params.model_path.c_str());
+	fprintf(stderr, "  -em FNAME, --encodec-model FNAME\n");
+	fprintf(stderr, "                                        Encodec model path (default: %s)\n", params.encodec_path.c_str());
+	fprintf(stderr, "  -t TEXT, --text TEXT\n");
+	fprintf(stderr, "                                        Input text prompt (default: %s)\n", args.text.c_str());
+	fprintf(stderr, "  -l TEXT, --language TEXT\n");
+	fprintf(stderr, "                                        Language for input text / output response (default: %s)\n", args.language.c_str());
+	fprintf(stderr, "  -ts TASK, --task TASK\n");
+	fprintf(stderr, "                                        Inferencing task (default: %s, accepts ['tts', 'stt', 'ns', 'sr'])\n", args.task.c_str());
+	fprintf(stderr, "  -mode MODE, --modality MODE\n");
+	fprintf(stderr, "                                        Modality for inferencing (default: %s, accepts ['ar+nar', 'nar-len'])\n", args.modality == MODALITY_NAR_LEN ? "nar-len" : "ar+nar");
+	fprintf(stderr, "  -ms N, --max-steps N\n");
+	fprintf(stderr, "                                        Max steps for `nar-len` (default: %i)\n", args.max_steps);
+	fprintf(stderr, "  -md N, --max-duration N\n");
+	fprintf(stderr, "                                        Max duration of the audio (default: %i)\n", args.max_duration);
+	fprintf(stderr, "  -i FNAME, --input FNAME\n");
+	fprintf(stderr, "                                        Input prompt wav (default: %s)\n", args.prompt_path.c_str());
+	fprintf(stderr, "  -o FNAME, --output FNAME\n");
+	fprintf(stderr, "                                        Output audio wav (default: %s)\n", args.output_path.c_str());
+	fprintf(stderr, "\n");
 }
 bool vall_e_args_parse( int argc, char** argv, vall_e_context_params_t& params, vall_e_args_t& args ) {
 	for ( int i = 1; i < argc; i++ ) {
@@ -873,7 +911,7 @@ bool vall_e_args_parse( int argc, char** argv, vall_e_context_params_t& params, 
 		} else if (arg == "-ts" || arg == "--task") {
 			args.task = argv[++i];
 		} else if (arg == "-mode" || arg == "--modality") {
-			args.modality = argv[++i] == "ar+nar" ? MODALITY_AR_NAR : MODALITY_NAR_LEN;
+			args.modality = std::string(argv[++i]) == "ar+nar" ? MODALITY_AR_NAR : MODALITY_NAR_LEN;
 		} else if (arg == "-ms" || arg == "--max-steps") {
 			args.max_steps = std::stoi(argv[++i]);
 		} else if (arg == "-md" || arg == "--max-duration") {
@@ -908,7 +946,7 @@ vall_e_context_t* vall_e_load( const vall_e_context_params_t& params ) {
 	llama_model_params model_params = llama_model_default_params();
 	model_params.n_gpu_layers = params.gpu_layers;
 
-	ctx->llama.model = llama_load_model_from_file(params.model_path.c_str(), model_params);
+	ctx->llama.model = llama_model_load_from_file(params.model_path.c_str(), model_params);
 	if ( !ctx->llama.model ) {
 		fprintf(stderr , "%s: error: unable to load model\n" , __func__);
 		return ctx;
@@ -924,7 +962,7 @@ vall_e_context_t* vall_e_load( const vall_e_context_params_t& params ) {
 	ctx_params.no_perf = false;
 	ctx_params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL; 
 
-	ctx->llama.ctx = llama_new_context_with_model(ctx->llama.model, ctx_params);
+	ctx->llama.ctx = llama_init_from_model(ctx->llama.model, ctx_params);
 	if ( !ctx->llama.ctx ) {
 		fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
 		return ctx;
@@ -1022,7 +1060,7 @@ void vall_e_free( vall_e_context_t* ctx ) {
 	espeak_Terminate();
 	encodec_free(ctx->encodec.ctx);
 	llama_free(ctx->llama.ctx);
-	llama_free_model(ctx->llama.model);
+	llama_model_free(ctx->llama.model);
 	ggml_free(ctx->io_map->ctx);
 	delete ctx->io_map;
 	delete ctx;

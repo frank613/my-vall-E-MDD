@@ -12,7 +12,7 @@ import torch
 import itertools
 
 from .config import cfg
-from .emb.qnt import trim, trim_random, repeat_extend_audio, concat_audio, merge_audio, decode_to_file, decode as decode_qnt, encode as encode_qnt, pad_codes_with_silence
+from .emb.qnt import post_process, trim, trim_random, repeat_extend_audio, concat_audio, merge_audio, decode_to_file, decode as decode_qnt, encode as encode_qnt, pad_codes_with_silence
 from .emb.g2p import encode as encode_phns
 from .utils.sampler import PoolSampler, OrderedSampler, BatchedOrderedSampler, RandomSampler
 from .utils.distributed import global_rank, local_rank, world_size, is_global_leader
@@ -693,7 +693,8 @@ def _replace_file_extension(path, suffix):
 	return (path.parent / path.name.split(".")[0]).with_suffix(suffix)
 
 def _get_artifact_extension():
-	return ".dac" if cfg.audio_backend == "dac" else ".enc"
+	#return ".dac" if cfg.audio_backend == "dac" else ".enc"
+	return cfg.audio_backend_extension
 
 def _get_metadata_extension():
 	return ".json"
@@ -701,115 +702,99 @@ def _get_metadata_extension():
 def _get_artifact_path(path):
 	return _replace_file_extension(path, _get_artifact_extension())
 
-_durations_map = {}
-def _get_duration_map( type="training" ):
-	return _durations_map[type] if type in _durations_map else {}
+def _get_path_key( type, dir, id ):
+	return f"/{type}/{_get_hdf5_path(dir)}/{id}" if cfg.dataset.use_hdf5 else str(dir / id)
 
-def _load_paths(dataset, type="training", silent=not is_global_leader(), dataset_hash_key=None):
+def _load_dataset_metadata(dataset, type="training", silent=not is_global_leader(), dataset_hash_key=None):
+	assert cfg.dataset.min_duration >= 1.0, "Minimum duration too low."
+	
+	# for now only ensure metadata-based path
+	assert cfg.dataset.use_metadata, "Metadata required."
+
 	if not dataset_hash_key:
 		dataset_hash_key = cfg.dataset.hash_key(sorted(dataset))
 
 	cached_dir = cfg.cache_dir / dataset_hash_key
-	
-	cached_durations_path = cached_dir / f"durations[{type}].json"
-	cached_paths_path = cached_dir / f"dataloader[{type}].json"
-	
-	# load the duration table first, since this is independent from the loaded paths
-	if cached_durations_path.exists():
-		_durations_map[type] = json_read( cached_durations_path )
-	
-	# load the cached valid paths (if we're requesting cache use)
-	if cached_paths_path.exists() and cfg.dataset.cache:
-		# to-do: automatic conversion between HDF5 formatted paths and on-disk paths
-		return json_read( cached_paths_path )
+	cached_path = cached_dir / f"dataset[{type}].json"
 
-	# deduce valid paths
-	paths = { cfg.get_spkr( cfg.data_dir / data_dir / "dummy" ): _load_paths_from_metadata( data_dir, type=type, validate=cfg.dataset.validate and type == "training" ) for data_dir in tqdm(dataset, desc=f"Parsing dataset: {type}", disable=silent) }
+	if cached_path.exists() and cfg.dataset.cache:
+		return json_read( cached_path )
+
+	dataset_metadata = {}
+	def validate_utterance( id, entry ):
+		duration = entry.get('duration', 0)
+		in_bounds = cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
+		
+		if cfg.dataset.validate and type == "training" and not in_bounds:
+			return False
+
+		if cfg.dataset.strict_validate:
+			if cfg.dataset.use_hdf5 and key(type, dir, id) not in cfg.hdf5:
+				return False
+
+			if not (cfg.data_dir / dir / id).with_suffix(_get_artifact_extension()).exists():
+				return False
+
+		return True
+
+	def process_utterance( id, entry, metadata_keys=None ):
+		duration = entry.get('duration', 0)
+		similar = entry.get('similar', None)
+		# store duration length, and similar key name (because indices might shift)
+		return [duration, ([ metadata_keys[idx] for idx in similar ] if similar and metadata_keys else [])]
+
+	for dir in tqdm(dataset, desc=f"Parsing dataset: {type}", disable=silent ):
+		metadata_path = cfg.metadata_dir / f'{dir}.json'
+		if not metadata_path.exists():
+			continue
+
+		# to-do: make json_read handle when it actually can't read the file......
+		try:
+			metadata = json_read( metadata_path )
+		except Exception as e:
+			continue
+		
+		speaker = str(dir)
+		metadata_keys = list(metadata.keys())
+		dataset_metadata[speaker] = { id: process_utterance( id, entry, metadata_keys ) for id, entry in metadata.items() if validate_utterance( id, entry ) }
+
+		# remap strings to indices
+		remapped_indices = { k: i for i, k in enumerate(dataset_metadata[speaker].keys()) }
+		for id, (duration, similars) in dataset_metadata[speaker].items():
+			dataset_metadata[speaker][id][1] = [ remapped_indices[k] for k in similars if k in remapped_indices ]
 
 	# and write if global leader (to avoid other processes writing to the same file at once)
 	if is_global_leader():
 		if not cached_dir.exists():
 			cached_dir.mkdir(parents=True, exist_ok=True)
 
-		json_write( _durations_map[type], cached_durations_path, truncate=True )
-		json_write( paths, cached_paths_path, truncate=True )
+		json_write( dataset_metadata, cached_path, truncate=True )
 
-	return paths
-
-def _load_paths_from_metadata(group_name, type="training", validate=False):
-	data_dir = group_name if cfg.dataset.use_hdf5 else cfg.data_dir / group_name
-
-	_fn = _get_hdf5_paths if cfg.dataset.use_hdf5 else _get_paths_of_extensions
-
-	def key( id, entry=None ):
-		return f"/{type}/{_get_hdf5_path(data_dir)}/{id}" if cfg.dataset.use_hdf5 else str(data_dir / id)
-
-	metadata_path = cfg.metadata_dir / f'{group_name}.json'
-	metadata = {}
-
-	if cfg.dataset.use_metadata and metadata_path.exists():
-		#metadata = json.loads(open( metadata_path, "r", encoding="utf-8" ).read())
-		try:
-			metadata = json_read( metadata_path )
-		except Exception as e:
-			return []
-
-	if len(metadata) == 0:
-		return _fn( data_dir, type if cfg.dataset.use_hdf5 else _get_artifact_extension(), validate )
-
-	def _validate( id, entry ):
-		phones = entry['phones'] if "phones" in entry else 0
-		duration = entry['duration'] if "duration" in entry else 0
-
-		# add to duration bucket
-		k = key(id, entry)
-		if type not in _durations_map:
-			_durations_map[type] = {}
-		_durations_map[type][k] = duration
-
-		if not validate:
-			return True
-
-		return cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
-
-	return [ key(id, entry) for id, entry in metadata.items() if _validate(id, entry) ]
-
-
-def _get_hdf5_path(path):
-	# to-do: better validation
-	return str(path)
-
-def _get_hdf5_paths( data_dir, type="training", validate=False ):
-	data_dir = str(data_dir)
-	
-	key = f"/{type}/{_get_hdf5_path(data_dir)}"
-
-	def _validate( id, entry ):
-		phones = entry.attrs['phonemes']
-		duration = entry.attrs['duration']
-
-		if type not in _durations_map:
-			_durations_map[type] = {}
-		_durations_map[type][f"{key}/{id}"] = duration
-
-		if not validate:
-			return True
-		
-		return cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
-
-	return [ Path(f"{key}/{id}") for id, entry in cfg.hdf5[key].items() if _validate(id, entry) ] if key in cfg.hdf5 else []
+	return dataset_metadata
 
 def _get_paths_of_extensions( path, extensions=_get_artifact_extension(), validate=False ):
 	if isinstance(path, str):
 		path = Path(path)
 	
-	return [ p for p in list(path.iterdir()) ] if path.exists() and path.is_dir() else []
+	return [ str(p) for p in list(path.iterdir()) ] if path.exists() and path.is_dir() else []
 
-def _load_artifact(path, return_metadata=False) -> Tensor:
-	qnt = np.load(_get_artifact_path(path), allow_pickle=True)[()]
+def _load_artifact(path, return_metadata=False, return_artifact=False, validate=True) -> Tensor:
+	artifact = np.load(_get_artifact_path(path), allow_pickle=True)[()]
+	codes = artifact["codes"]
+	
+	if validate and np.count_nonzero(codes) == 0:
+		raise Exception(f"Artifact contains zero'd tensor: {path}")
+
+	codes = torch.from_numpy(codes.astype(int)).to(torch.int16)
+	codes = post_process( codes )
+
+	if return_artifact:
+		return codes, artifact
+
 	if return_metadata:
-		return torch.from_numpy(qnt["codes"].astype(int))[0][:, :].t().to(torch.int16), qnt["metadata"]
-	return torch.from_numpy(qnt["codes"].astype(int))[0][:, :].t().to(torch.int16)
+		return codes, artifact["metadata"]
+
+	return codes
 
 def _interleaved_reorder(l, fn):
 	groups = defaultdict(list)
@@ -826,9 +811,10 @@ class Dataset(_Dataset):
 		self,
 		phone_symmap=None,
 		training=False,
-		extra_paths_by_spkr_name: dict[str, list] = {},
+		extra_paths_by_speaker_name: dict[str, list] = {},
 	):
 		super().__init__()
+
 		self._head = None
 		self.sampler = None
 
@@ -836,61 +822,42 @@ class Dataset(_Dataset):
 
 		self.training = training
 		self.dataset_type = "training" if self.training else "validation"
-		self.dataset = sorted(cfg.dataset.training if self.training else cfg.dataset.validation)
 		self.sampler_type = cfg.dataset.sample_type if self.dataset_type == "training" else "path"
 		self.sampler_order = cfg.dataset.sample_order
 		self.sampler_shuffle = cfg.dataset.sample_shuffle if self.dataset_type == "training" else True
 
-		self.dataset_hash_key = cfg.dataset.hash_key(sorted(self.dataset))
+		dataset = sorted(cfg.dataset.training if self.training else cfg.dataset.validation)
+		self.dataset_hash_key = cfg.dataset.hash_key(dataset)
 		
 		self.duration = 0
 		self.duration_buckets = {}
 		self.current_index = 0
 		self.batch_size = cfg.hyperparameters.batch_size if self.training else cfg.evaluation.batch_size
 
-		# to-do: do not do validation if there's nothing in the validation
-		# this just makes it be happy
-		if len(self.dataset) == 0:
-			self.dataset = cfg.dataset.training
-
 		# hard error because I kept getting tricked by this myself
 		if self.sampler_order == "duration" and self.sampler_type != "path":
 			raise Exception(f'Requesting sample_type={self.sampler_type} with sample_order={self.sampler_order}, yet combination will not give expected results.')
 		
-		# dict of paths keyed by speaker names
-		self.paths_by_spkr_name = _load_paths(self.dataset, self.dataset_type, dataset_hash_key=self.dataset_hash_key)
-		self.duration_map = _get_duration_map( self.dataset_type )
+		# dict that maps [speaker][id] to (duration, similar utterances)
+		self.metadata = _load_dataset_metadata(dataset, self.dataset_type, dataset_hash_key=self.dataset_hash_key)
 
-		# cull speakers if they do not have enough utterances (or cull speakers with too many utternaces)
-		if cfg.dataset.min_utterances > 0 or cfg.dataset.max_utterances > 0:
-			keys = list(self.paths_by_spkr_name.keys())
-			for key in keys:
-				if len(self.paths_by_spkr_name[key]) < cfg.dataset.min_utterances:
-					del self.paths_by_spkr_name[key]
-					continue
-
-				# slice away extraneous utterances
-				if cfg.dataset.max_utterances:
-					self.paths_by_spkr_name[key] = self.paths_by_spkr_name[key][:cfg.dataset.max_utterances]
-
-		# flatten paths
-		self.paths = list(itertools.chain.from_iterable(self.paths_by_spkr_name.values()))
+		if len(self.metadata) == 0:
+			raise Exception(f'Empty dataset for {self.dataset_type}')
 		
+		# cull speakers with too little utterances
+		prune_keys = [ speaker for speaker in self.metadata.keys() if len(self.metadata[speaker]) < cfg.dataset.min_utterances ]
+		for speaker in prune_keys:
+			del self.metadata[speaker]
+
+		self.paths = []
+		self.speakers = list(self.metadata.keys())
+		self.paths = [ ((speaker_id, utterance_id), self.metadata[speaker][utterance][0]) for speaker_id, speaker in enumerate(self.speakers) for utterance_id, utterance in enumerate(self.metadata[speaker].keys()) ]
+
 		# split dataset accordingly per GPU
 		if cfg.distributed and self.training:
 			self.paths = [ path for i, path in enumerate(self.paths) if i % world_size() == 0 ]
 
-			# recreate paths_by_spkr_name
-			self.paths_by_spkr_name = {}
-			for path in self.paths:
-				name = cfg.get_spkr( Path(path) )
-				if name not in self.paths_by_spkr_name:
-					self.paths_by_spkr_name[name] = []
-				self.paths_by_spkr_name[name].append( path )
-
-		# store in corresponding bucket
-		for path in self.paths:
-			duration = self.duration_map[path]
+		for ((speaker_id, utterance_id), duration) in self.paths:
 			self.duration += duration
 			
 			# only calc duration if we're going to order by duration
@@ -900,7 +867,7 @@ class Dataset(_Dataset):
 			bucket = int(round(duration))
 			if bucket not in self.duration_buckets:
 				self.duration_buckets[bucket] = []
-			self.duration_buckets[bucket].append( ( Path(path), duration ) )
+			self.duration_buckets[bucket].append( ( (speaker_id, utterance_id), duration ) )
 
 		# sort by duration
 		if self.sampler_order == "duration":
@@ -911,43 +878,27 @@ class Dataset(_Dataset):
 			# sort and interleave
 			for bucket in self.duration_buckets:
 				# sort by duration
-				self.duration_buckets[bucket].sort( key=lambda x: x[1] )
+				self.duration_buckets[bucket].sort( key=lambda x: x[-1] )
 				# split to retain tuples
 				flattened[bucket] = self.duration_buckets[bucket]
 				# replace with path
 				flattened[bucket] = [ x[0] for x in flattened[bucket] ]
 				# flatten by paths
-				flattened[bucket] = [*_interleaved_reorder(flattened[bucket], self.get_speaker)]
+				flattened[bucket] = [*_interleaved_reorder(flattened[bucket], lambda x: x[0])]
 			# flatten paths
 			self.paths = list(itertools.chain.from_iterable(flattened.values()))
 		elif self.sampler_order == "random":
 			random.shuffle( self.paths )
 		else:
 			# just interleave
-			self.paths = [*_interleaved_reorder(self.paths, self.get_speaker)]
-		
-		# dict of speakers keyed by speaker group
-		self.spkrs_by_spkr_group = {}
-		for data_dir in self.dataset:
-			spkr = cfg.get_spkr( data_dir / "dummy" )
-			spkr_group = cfg.get_spkr_group( data_dir / "dummy" )
+			self.paths = [*_interleaved_reorder(self.paths, lambda x: x[0])]
 
-			if spkr not in self.paths_by_spkr_name or len(self.paths_by_spkr_name[spkr]) < cfg.dataset.min_utterances:
-				continue
-
-			if spkr_group not in self.spkrs_by_spkr_group:
-				self.spkrs_by_spkr_group[spkr_group] = []
-
-			self.spkrs_by_spkr_group[spkr_group].append( spkr )
-
-		self.spkr_groups = list(self.spkrs_by_spkr_group.keys())
-
-		self.noise_paths = _load_paths(cfg.dataset.noise, "noise")
-		self.noise_paths = list(itertools.chain.from_iterable(self.noise_paths.values()))
+		self.noise_metadata = _load_dataset_metadata(cfg.dataset.noise, "noise", dataset_hash_key=self.dataset_hash_key)
+		self.noise_speakers = list(self.noise_metadata.keys())
+		self.noise_paths = [ (speaker_id, utterance_id) for speaker_id, speaker in enumerate(self.noise_speakers) for utterance_id, utterance in enumerate(self.noise_metadata[speaker].keys()) ]
 
 		self.phone_symmap = phone_symmap or self._get_phone_symmap()
-		self.spkr_symmap = self._get_spkr_symmap()
-		self.spkr_group_symmap = self._get_spkr_group_symmap()
+		self.speaker_symmap = self._get_speaker_symmap()
 		self.lang_symmap = self._get_lang_symmap()
 		self.tone_symmap = self._get_tone_symmap()
 		self.task_symmap = self._get_task_symmap()
@@ -969,27 +920,16 @@ class Dataset(_Dataset):
 		if len(self.paths) == 0:
 			raise ValueError(f"No valid path is found for {self.dataset_type}")
 
-		if self.sampler_type == "path" and self.training:
-			if self.sampler_order == "duration" and cfg.dataset.sample_max_duration_batch > 0:
-				self.sampler = BatchedOrderedSampler(
-					self.duration_buckets if not self.sampler_state_dict_path.exists() else {}, # pass nothing if we're just going to load from a state anyways
-					max_duration=cfg.dataset.sample_max_duration_batch,
-					max_batch_size=self.batch_size,
-					shuffle=self.sampler_shuffle,
-				)
-				self.batch_size = 1
-			else:
-				self.sampler = OrderedSampler( len(self) ) if not self.sampler_shuffle else RandomSampler( len(self) )
-			self.samplers = {}
-			self.spkr_samplers = {}
+		if self.training and self.sampler_order == "duration" and cfg.dataset.sample_max_duration_batch > 0:
+			self.sampler = BatchedOrderedSampler(
+				self.duration_buckets if not self.sampler_state_dict_path.exists() else {}, # pass nothing if we're just going to load from a state anyways
+				max_duration=cfg.dataset.sample_max_duration_batch,
+				max_batch_size=self.batch_size,
+				shuffle=self.sampler_shuffle,
+			)
+			self.batch_size = 1
 		else:
-			self.sampler = RandomSampler( len(self) )
-			self.samplers = { name: PoolSampler( paths, keep_all=True, shuffle=self.sampler_shuffle ) for name, paths in self.paths_by_spkr_name.items() }
-			self.spkr_samplers = { name: PoolSampler( [*set(speakers)], keep_all=True, shuffle=self.sampler_shuffle ) for name, speakers in self.spkrs_by_spkr_group.items() }
-
-		# dereference buckets
-		self.duration_map = None
-		self.duration_buckets = None
+			self.sampler = OrderedSampler( len(self) ) if not self.sampler_shuffle else RandomSampler( len(self) )
 
 		self.load_state_dict() # ## for sampler only? for resume checkpoings of training ?
 
@@ -1000,13 +940,13 @@ class Dataset(_Dataset):
 	def get_speaker(self, path):
 		if isinstance(path, str):
 			path = Path(path)
-		res = cfg.get_spkr(path)
+		res = cfg.get_speaker(path)
 		return res
 
 	def get_speaker_group(self, path):
 		if isinstance(path, str):
 			path = Path(path)
-		res = cfg.get_spkr_group(path)
+		res = cfg.get_speaker_group(path)
 		return res
 
 	# this isn't really necessary since our data/metadata contains markers for languages, but this is still in in-case it's needed to force a language setting (for example, whisperX's lang isn't that accurate at times)
@@ -1017,10 +957,6 @@ class Dataset(_Dataset):
 				break
 
 		return lang.lower()
-
-	@cached_property
-	def spkrs(self):
-		return sorted({self.get_speaker(path) for path in self.paths})
 
 	@cached_property
 	def tasks(self):
@@ -1035,13 +971,16 @@ class Dataset(_Dataset):
 		if not path.parent.exists():
 			path.parent.mkdir(parents=True, exist_ok=True)
 
+		state_dict = self.sampler.get_state()
+		"""
 		if self.sampler_type == "path":
 			state_dict = self.sampler.get_state()
 		else:
 			state_dict = {
 				"samplers": { name: sampler.get_state() for name, sampler in self.samplers.items() },
-				"spkr_samplers": { name: sampler.get_state() for name, sampler in self.spkr_samplers.items() },
+				"speaker_samplers": { name: sampler.get_state() for name, sampler in self.speaker_samplers.items() },
 			}
+		"""
 
 		if "dataset_hash_key" not in state_dict:
 			state_dict["dataset_hash_key"] = self.dataset_hash_key
@@ -1064,6 +1003,8 @@ class Dataset(_Dataset):
 				_logger.warning(f'Mismatched dataset hash key for {self.dataset_type} dataloader, ignoring loading of state dict.')
 				return
 
+		state_dict = self.sampler.set_state(state_dict)
+		"""
 		if self.sampler_type == "path":
 			state_dict = self.sampler.set_state(state_dict)
 		else:
@@ -1072,19 +1013,17 @@ class Dataset(_Dataset):
 					continue
 				self.samplers[name].set_state( sampler )
 
-			for name, sampler in state_dict["spkr_samplers"].items():
-				if name not in self.spkr_samplers:
+			for name, sampler in state_dict["speaker_samplers"].items():
+				if name not in self.speaker_samplers:
 					continue
-				self.spkr_samplers[name].set_state( sampler )
+				self.speaker_samplers[name].set_state( sampler )
+		"""
 
 	def _get_phone_symmap(self):
 		return get_phone_symmap()
 
-	def _get_spkr_symmap(self):
-		return {s: i for i, s in enumerate(self.spkrs)}
-
-	def _get_spkr_group_symmap(self):
-		return {s: i for i, s in enumerate(self.spkr_groups)}
+	def _get_speaker_symmap(self):
+		return {s: i for i, s in enumerate(self.speakers)}
 
 	def _get_lang_symmap(self):
 		return get_lang_symmap()
@@ -1096,27 +1035,34 @@ class Dataset(_Dataset):
 		return get_task_symmap()
 
 	def sample_noise(self):
-		path = random.choice(self.noise_paths)
+		speaker_id, utterance_id = random.choice(self.noise_paths)
+		
+		speaker_name = self.noise_speakers[speaker_id]
+		utterance_name = list(self.noise_metadata[speaker_name].keys())[utterance_id]
+
+		path = cfg.data_dir / speaker_name / utterance_name
 
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
 			qnt = torch.from_numpy(cfg.hdf5[key]["audio"][:, :]).to(torch.int16)
 		else:
-			qnt = _load_artifact(path, return_metadata=False)
+			qnt = _load_artifact(path, return_metadata=False, return_artifact=False)
 		return qnt
 
 	def sample_speakers(self, ignore=[]):
-		choices = set(self.spkrs) - set(ignore)
+		choices = set(self.speakers) - set(ignore)
 		return random.choice([*choices])
 
-	def sample_utterance(self, spkr_name, ignore=[]):
-		choices = [*(set(self.paths_by_spkr_name[spkr_name]) - set(ignore))]
+	def sample_utterance(self, speaker_name, ignore=[]):
+		choices = [*(set(self.metadata[speaker_name].keys()) - set(ignore))]
 
 		if len(choices) == 0:
 			return None, None, None
 		
-		path = random.choice(choices)
+		utterance_id = random.choice(choices)
+		utterance_name = list(self.metadata[speaker_name].keys())[utterance_id]
 			
+		path = cfg.data_dir / speaker_name / utterance_name
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
 
@@ -1148,62 +1094,48 @@ class Dataset(_Dataset):
 		return path, text, resps
 
 	# icky slop
-	def get_similar_utterance(self, path, offset=None ):
+	def get_similar_utterance(self, speaker_name, utterance_name, offset=None ):
 		if offset is None:
 			offset = cfg.dataset.prompt_similar_top_k_offset
 
-		reference = path.name
+		_, similars = self.metadata[speaker_name][utterance_name]
 
-		if cfg.dataset.use_hdf5:
-			root = Path( *path.parts[:-1] )
-			path = Path( *path.parts[2:-1] )
-		else:
-			root = Path( *path.parts[:-1] )
-			path = Path(*path.parts[len(cfg.data_dir.parts):-1])
-
-		metadata = json_read( cfg.metadata_dir / path.with_suffix(".json"), default={} )
-
-		if reference not in metadata:
+		if not similars:
 			return None
 
-		reference_metadata = metadata[reference]
-
-		if "similar" not in reference_metadata:
-			return None
-
-		if len(reference_metadata["similar"]) >= offset:
+		if len(similars) >= offset:
 			offset = 0
 
-		metadata_keys = list(metadata.keys())
+		# cringe stopgap
+		offset_end = offset + cfg.dataset.prompt_similar_top_k
 
+		if offset >= len( similars ):
+			return None
+		if offset_end >= len( similars ):
+			return None
+
+		utterance_keys = list(self.metadata[speaker_name].keys())
 		if cfg.dataset.prompt_similar_top_k > 1:
-			indices = reference_metadata["similar"][offset:offset+cfg.dataset.prompt_similar_top_k]
-			index = random.choice( indices )
+			index = random.choice( similars[offset:offset_end] )
 		else:
-			index = reference_metadata["similar"][offset]
-		name = metadata_keys[index]
+			index = similars[offset]
 
-		return root / name
+		return utterance_keys[index]
 
-	def sample_prompts(self, spkr_name, reference, should_trim=True):
+	def sample_prompts(self, speaker_name, utterance_name=None, should_trim=True):
 		# return no prompt if explicitly requested for who knows why
 		# or if there's no other speakers to sample from (Emilia has a lot of singleton speakers, but I still want to make use of them)
-		if len(self.paths_by_spkr_name[spkr_name]) <= 1:
+		if len(self.metadata[speaker_name]) <= 1:
 			return None
 
 		prom_list = []
 
-		choices = set(self.paths_by_spkr_name[spkr_name]) - {reference}
+		choices = set(self.metadata[speaker_name].keys()) - {utterance_name}
 		choices = [*choices]
 
 		# no other utterances, it'd make more sense to prune speakers with only one utterance in the validation step
 		if len(choices) == 0:
-			choices = [*set(self.paths_by_spkr_name[spkr_name])]
-			"""
-			raise ValueError(
-				f"Failed to find another different utterance for {spkr_name}."
-			)
-			"""
+			choices = [*set(self.metadata[speaker_name].keys())]
 
 		if not cfg.dataset.prompt_duration_range or cfg.dataset.prompt_duration_range[1] <= 0:
 			should_trim = False
@@ -1216,20 +1148,32 @@ class Dataset(_Dataset):
 			trim_length = 0
 
 		for _ in range(cfg.dataset.prompt_max_samples):
-			if reference is not None:
-				# yuck
-				path = None
+			# yuck
+			sampled_utterance = None
+			if utterance_name is not None:
 				if random.random() < cfg.dataset.prompt_similar_p:
-					path = self.get_similar_utterance( reference, offset = len(prom_list) )
-				if not path:
-					path = random.choice(choices)
-			else:
-				path = random.choice(choices)
+					try:
+						sampled_utterance = self.get_similar_utterance( speaker_name, utterance_name, offset = len(prom_list) )
+					except Exception as e:
+						sampled_utterance = None
+
+			if not sampled_utterance:
+				sampled_utterance = random.choice(choices)
+
+			path = cfg.data_dir / speaker_name / sampled_utterance
 			if cfg.dataset.use_hdf5:
 				key = _get_hdf5_path(path)
+				if key not in cfg.hdf5:
+					_logger.warning(f'Key of Path ({path}) not in HDF5: {key}')
+					continue
 				qnt = torch.from_numpy(cfg.hdf5[key]["audio"][:, :]).to(torch.int16)
 			else:
-				qnt = _load_artifact(path, return_metadata=False)
+				try:
+					qnt = _load_artifact(path, return_metadata=False)
+				except Exception as e:
+					_logger.warning(f'Failed to load artifact: {path} ({e})')
+					path = None
+					continue
 
 			if 0 < trim_length and trim_length < qnt.shape[0]:
 				qnt = trim( qnt, trim_length, reencode=cfg.dataset.reencode_on_concat, device=cfg.dataset.reencode_device )
@@ -1257,33 +1201,28 @@ class Dataset(_Dataset):
 		
 		bos_id, space_id, eos_id = self.empty_text
 
-		if self.sampler_type == "group":
-			spkr_group = self.spkr_groups[index]
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
-			spkr_name = self.spkr_samplers[spkr_group].sample()
-			spkr_id = self.spkr_symmap[spkr_name]
-			path = self.samplers[spkr_name].sample()
-		elif self.sampler_type == "speaker":
-			spkr_name = self.spkrs[index]
-			spkr_id = self.spkr_symmap[spkr_name]
-			path = self.samplers[spkr_name].sample()
-			spkr_group = self.get_speaker_group(path)
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
+		if self.sampler_type == "speaker":
+			speaker_id = index
+			speaker_name = self.speakers[speaker_id]
+			utterance_name = random.choice( list(self.metadata[speaker_name].keys()) ) # random.choice(self.metadata[speaker_name])
 		else:
-			path = self.paths[index]
-			spkr_name = self.get_speaker(path)
-			spkr_id = self.spkr_symmap[spkr_name]
-			spkr_group = self.get_speaker_group(path)
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
-
-		if not isinstance( path, Path ):
-			path = Path( path )
+			speaker_id, utterance_id = self.paths[index]
+			speaker_name = self.speakers[speaker_id]
+			utterance_name = list(self.metadata[speaker_name].keys())[utterance_id]
+		
+		path = cfg.data_dir / speaker_name / utterance_name
 
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
 
 			if key not in cfg.hdf5:
-				raise RuntimeError(f'Key of Path ({path}) not in HDF5: {key}')
+				_logger.warning(f'Key of Path ({path}) not in HDF5: {key}')
+				return dict(path=None)
+
+			# cringe stopgap
+			if "text" not in cfg.hdf5[key] or "audio" not in cfg.hdf5[key]:
+				_logger.warning(f"text/audio not in entry: {key}")
+				return dict(path=None)
 
 			# I need to do some weird coersion to a normal dict because it'll bitch about Hdf5 objects not being pickleable in worker processes
 			metadata = { f'{k}': f'{v}' for k, v in cfg.hdf5[key].attrs.items() }
@@ -1308,12 +1247,15 @@ class Dataset(_Dataset):
 			tone = metadata["tone"] if "tone" in metadata else None
 			text_string = metadata["text"] if "text" in metadata else None
 
-		lang = self.get_language(spkr_group) if not lang else lang.lower()
+		lang = lang.lower() if lang else "en"
 
 		raw_text = torch.tensor(text_tokenize(text_string)).to(torch.int16) if text_string else None
 		
 		if not tone:
 			tone = "neutral"
+
+		if lang == "auto":
+			lang = "en"
 
 		lang = torch.tensor([self.lang_symmap[lang]]).to(torch.uint8)
 		tone = torch.tensor([self.tone_symmap[tone]]).to(torch.uint8)
@@ -1325,7 +1267,7 @@ class Dataset(_Dataset):
 		if cfg.dataset.resps_max_samples > 1 and random.random() < cfg.dataset.resps_append_p:
 			ignore_paths = []
 			for _ in range( 1, cfg.dataset.resps_max_samples ):
-				path, txt, qnt = self.sample_utterance(spkr_name, ignore=ignore_paths)
+				path, txt, qnt = self.sample_utterance(speaker_name, ignore=ignore_paths)
 				ignore_paths.append(path)
 
 				# <s>[original text]</s><s>[new text]</s>
@@ -1339,7 +1281,7 @@ class Dataset(_Dataset):
 				# might be better to decode => concat waveforms with silence in between => reencode
 				# as you technically can't just append encodec sequences together like this without issues
 				resps = concat_audio( resps, qnt, reencode=cfg.dataset.reencode_on_concat, device=cfg.dataset.reencode_device )
-		
+
 		task = random.choice(self.tasks)
 
 		if task not in self.task_symmap:
@@ -1347,8 +1289,10 @@ class Dataset(_Dataset):
 
 		# Base TTS (<text><prompt> => <resp>)
 		if task == "tts":
-			proms = self.sample_prompts(spkr_name, reference=path)
+			proms = self.sample_prompts(speaker_name, utterance_name)
 
+			"""
+			proms = self.sample_prompts(speaker_name, reference=path)
 			if random.random() < cfg.dataset.prompt_inject_noise_p:
 				# sample random noise
 				noise = self.sample_noise()
@@ -1356,7 +1300,7 @@ class Dataset(_Dataset):
 				noise = repeat_extend_audio(noise, proms.shape[0])
 				# create the input prompt by merging the target audio with the noise
 				proms = merge_audio( proms, noise, scale=[1, cfg.dataset.noise_scale], device=cfg.dataset.reencode_device )
-
+			"""
 
 		# VALL-E Continuous (<text><partial resp> => <remaining resp> )
 		#     (this could just be sampled as <text a><text b><audio a> => <audio b>, but I need to experiment with it)
@@ -1369,7 +1313,7 @@ class Dataset(_Dataset):
 				proms = resps[:trim_length, :]
 				resps = resps[trim_length:, :]
 			else:
-				path, txt, qnt = self.sample_utterance(spkr_name)
+				path, txt, qnt = self.sample_utterance(speaker_name)
 
 				# <s>[original text]</s><s>[new text]</s>
 				if naive:
@@ -1398,7 +1342,7 @@ class Dataset(_Dataset):
 
 		# Duration prediction (<text><prompt> => len(<resp>))
 		elif task == "len":
-			proms = self.sample_prompts(spkr_name, reference=path)
+			proms = self.sample_prompts(speaker_name, utterance_name)
 
 		elif task in ["phn", "un-phn"]:
 			proms = []
@@ -1430,10 +1374,10 @@ class Dataset(_Dataset):
 		# target speech extraction ( <text><prom><resp + other resp> => <resp> )
 		elif task == "tse":
 			# sample a prompt
-			proms = self.sample_prompts(spkr_name, reference=path)
+			proms = self.sample_prompts(speaker_name, utterance_name)
 
 			# sample another speaker
-			_, __, other_resps = self.sample_utterance(self.sample_speakers(ignore=[spkr_name]))
+			_, __, other_resps = self.sample_utterance(self.sample_speakers(ignore=[speaker_name]))
 
 			# overlay the random speaker over the target audio
 			other_resps = merge_audio( resps, other_resps, scale=[1, random.uniform(0.5, 0.75)], device=cfg.dataset.reencode_device )
@@ -1458,7 +1402,7 @@ class Dataset(_Dataset):
 
 			samples = []
 			for _ in range( 4 ):
-				sampled = self.sample_utterance(spkr_name, ignore=[s[0] for s in samples])
+				sampled = self.sample_utterance(speaker_name, ignore=[s[0] for s in samples])
 				samples.append( sampled )
 
 			pre_text, mid_text, post_text, edit_text = [ s[1][1:-1] for s in samples ]
@@ -1538,15 +1482,16 @@ class Dataset(_Dataset):
 		return dict(
 			index=index,
 			path=Path(path),
-			spkr_name=spkr_name,
-			spkr_id=spkr_id,
+			speaker_name=speaker_name,
+			speaker_id=speaker_id,
 			task=task,
 			lang=lang,
 			tone=tone,
-			text=text,
 			proms=proms,
 			resps=resps,
-			raw_text=raw_text,
+			
+			phns=text,
+			text=raw_text,
 			
 			metadata=metadata,
 		)
@@ -1566,14 +1511,13 @@ class Dataset(_Dataset):
 		return len(self.sampler if self.sampler is not None else self) // self.batch_size
 
 	def __len__(self):
-		if self.sampler_type == "group":
-			return min(len(self.spkr_groups), self._head or len(self.spkr_groups))
 		if self.sampler_type == "speaker":
-			return min(len(self.spkrs), self._head or len(self.spkrs))
+			return min(len(self.speakers), self._head or len(self.speakers))
 		return min(len(self.paths), self._head or len(self.paths))
 
 
 def collate_fn(samples: list[dict]):
+	samples = [ s for s in samples if s["path"] is not None ]
 	batch: dict[str, Any] = {k: [s[k] for s in samples] for k in samples[0]}
 	return batch
 
@@ -1599,7 +1543,7 @@ def _create_dataloader(dataset, training):
 		num_workers=cfg.dataset.workers,
 		collate_fn=collate_fn,
 		persistent_workers=cfg.dataset.workers > 1,
-		pin_memory=False,
+		pin_memory=True,
 		worker_init_fn=_seed_worker,
 		**kwargs,
 	)
@@ -1615,8 +1559,7 @@ def create_train_dataloader():
 	train_dl = _create_dataloader(train_dataset, training=True)
 
 	_logger.info(str(train_dataset.phone_symmap))
-	_logger.info(str(train_dataset.spkr_symmap))
-	_logger.info(str(train_dataset.spkr_group_symmap))
+	_logger.info(str(train_dataset.speaker_symmap))
 	
 	_logger.info(f"#samples (train): {len(train_dataset)}.")
 	_logger.info(f"#duration (train): {str(train_dataset.duration)}.")
@@ -1631,8 +1574,7 @@ def create_val_dataloader():
 	val_dl = _create_dataloader(val_dataset, training=False)
 
 	_logger.info(str(val_dataset.phone_symmap))
-	_logger.info(str(val_dataset.spkr_symmap))
-	_logger.info(str(val_dataset.spkr_group_symmap))
+	_logger.info(str(val_dataset.speaker_symmap))
 	
 	_logger.info(f"#samples (val): {len(val_dataset)}.")
 	_logger.info(f"#duration (val): {str(val_dataset.duration)}.")
@@ -1649,8 +1591,7 @@ def create_train_val_dataloader():
 	val_dl = _create_dataloader(val_dataset, training=False)
 
 	_logger.info(str(train_dataset.phone_symmap))
-	_logger.info(f'#speakers (train): {len(train_dataset.spkr_symmap)}')
-	_logger.info(f'#groups (train): {len(train_dataset.spkr_group_symmap)}')
+	_logger.info(f'#speakers (train): {len(train_dataset.speaker_symmap)}')
 
 	_logger.info(f"#samples (train): {len(train_dataset)}.")
 	_logger.info(f"#samples (val): {len(val_dataset)}.")
@@ -1758,9 +1699,7 @@ def create_dataset_metadata( skip_existing=False ):
 
 				utterance_metadata = {}
 				if audios:
-					artifact = np.load(quant_path, allow_pickle=True)[()]
-					qnt = torch.from_numpy(artifact["codes"].astype(int))[0].t().to(dtype=torch.int16)
-
+					qnt, artifact = _load_artifact(quant_path, return_artifact=True)
 					utterance_metadata = process_artifact_metadata( artifact )
 					# to-do: derive duration from codes if duration is malformed because this happened to me with LibriTTS-R
 					utterance_metadata["duration"] = qnt.shape[0] / cfg.dataset.frames_per_second
@@ -1866,9 +1805,7 @@ def create_dataset_hdf5( skip_existing=True ):
 
 				# audio
 				if audios:
-					artifact = np.load(f'{root}/{name}/{id}{_get_artifact_extension()}', allow_pickle=True)[()]
-					qnt = torch.from_numpy(artifact["codes"].astype(int))[0].t().to(dtype=torch.int16)
-
+					qnt, artifact = _load_artifact(f'{root}/{name}/{id}{_get_artifact_extension()}', return_artifact=True)
 					utterance_metadata = process_artifact_metadata( artifact )
 
 					if "audio" not in group:
@@ -1947,7 +1884,6 @@ if __name__ == "__main__":
 
 		samples = {
 			"training": [ next(iter(train_dl)),  next(iter(train_dl)) ],
-			#"evaluation": [ next(iter(subtrain_dl)),  next(iter(subtrain_dl)) ],
 			"validation": [ next(iter(val_dl)),  next(iter(val_dl)) ],
 		}
 
@@ -1973,31 +1909,24 @@ if __name__ == "__main__":
 			for i in range(len(v)):
 				_logger.info(f'{k}[{i}]: {v[i]}')
 	elif args.action == "validate":
-		train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
+		train_dl, val_dl = create_train_val_dataloader()
 		dataset = train_dl.dataset
 
 		missing = []
 		symmap = get_phone_symmap()
 
 		for index in tqdm(range(len( dataset )), desc="Processing dataset..."):
-			if dataset.sampler_type == "group":
-				spkr_group = dataset.spkr_groups[index]
-				#spkr_group_id = dataset.spkr_group_symmap[spkr_group]
-				spkr_name = dataset.spkr_samplers[spkr_group].sample()
-				spkr_id = dataset.spkr_symmap[spkr_name]
-				path = dataset.samplers[spkr_name].sample()
-			elif dataset.sampler_type == "speaker":
-				spkr_name = dataset.spkrs[index]
-				spkr_id = dataset.spkr_symmap[spkr_name]
-				path = dataset.samplers[spkr_name].sample()
-				spkr_group = dataset.get_speaker_group(path)
-				#spkr_group_id = dataset.spkr_group_symmap[spkr_group]
+			if dataset.sampler_type == "speaker":
+				speaker_id = index
+				speaker_name = dataset.speakers[speaker_id]
+				utterance_name = random.choice( list(dataset.metadata[speaker_name].keys()) ) # random.choice(dataset.metadata[speaker_name])
 			else:
-				path = dataset.paths[index]
-				spkr_name = dataset.get_speaker(path)
-				spkr_id = dataset.spkr_symmap[spkr_name]
-				spkr_group = dataset.get_speaker_group(path)
-				#spkr_group_id = dataset.spkr_group_symmap[spkr_group]
+				speaker_id, utterance_id = dataset.paths[index]
+				speaker_name = dataset.speakers[speaker_id]
+				speaker_keys = list(dataset.metadata[speaker_name].keys())
+				utterance_name = speaker_keys[utterance_id]
+
+			path = cfg.data_dir / speaker_name / utterance_name
 
 			if cfg.dataset.use_hdf5:
 				key = _get_hdf5_path(path)
@@ -2042,7 +1971,7 @@ if __name__ == "__main__":
 		index = 0
 		cfg.dataset.tasks_list = args.tasks.split(",")
 		
-		train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
+		train_dl, val_dl = create_train_val_dataloader()
 		batch = next(iter(train_dl))
 
 		for text, resps, proms, task in zip(batch["text"], batch["resps"], batch["proms"], batch["task"]):

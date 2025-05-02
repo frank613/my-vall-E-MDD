@@ -22,6 +22,7 @@ import torchaudio.functional as F
 import torchaudio.transforms as T
 
 from ..config import cfg
+from ..data import _load_artifact
 from ..utils import truncate_json, coerce_dtype
 from ..utils.io import json_read, json_write
 
@@ -48,18 +49,19 @@ tts = None
 
 # this is for computing SIM-O, but can probably technically be used for scoring similar utterances
 @cache
-def _load_sim_model(device="cuda", dtype="float16", model_name='microsoft/wavlm-large'):
+def _load_sim_model(device="cuda", dtype="float16", model_name='microsoft/wavlm-large', finetune=False):
 	from ..utils.ext.ecapa_tdnn import ECAPA_TDNN_SMALL
 	model = ECAPA_TDNN_SMALL(feat_dim=1024, feat_type='wavlm_large')
 
-	finetune_path = Path("./data/models/wavlm_large_finetune.pth")
-	if not finetune_path.exists():
-		download_model(finetune_path)
+	if finetune:
+		finetune_path = Path("./data/models/wavlm_large_finetune.pth")
+		if not finetune_path.exists():
+			download_model(finetune_path)
 
-	state_dict = torch.load( finetune_path )
-	state_dict = state_dict['model']
-	del state_dict['loss_calculator.projection.weight']
-	model.load_state_dict( state_dict )
+		state_dict = torch.load( finetune_path )
+		state_dict = state_dict['model']
+		del state_dict['loss_calculator.projection.weight']
+		model.load_state_dict( state_dict )
 
 	model = model.to(device=device, dtype=coerce_dtype(dtype))
 	model = model.eval()
@@ -88,6 +90,7 @@ def speaker_similarity_embedding(
 	audio,
 	**model_kwargs,
 ):
+	model_kwargs["finetune"] = True
 	device = model_kwargs.get("device", "cuda")
 	dtype = model_kwargs.get("dtype", "float16")
 
@@ -111,9 +114,7 @@ def speaker_similarity_embedding(
 def batch_similar_utterances(
 	speaker_path,
 	yaml,
-	text=False,
 
-	audio_backend="encodec",
 	device="cuda",
 	dtype="float16",
 	amp=False,
@@ -121,13 +122,18 @@ def batch_similar_utterances(
 	verbose=False,
 	metadata_path=None,
 	top_k=8,
+	top_p=0.5,
 	metadata_keys=[],
 
 	trim_duration=0,
 	min_duration=0,
 	max_duration=0,
 	
-	storage_backend="slop"
+	audio_backend="encodec",
+	storage_backend="slop",
+	similarity_backend="resp",
+
+	return_features=False,
 ):
 	global tts
 
@@ -151,19 +157,29 @@ def batch_similar_utterances(
 	if not speaker_path.exists():
 		return
 
+	# to-do: find decent thresholds
+	"""
+	if similarity_backend != "wavlm":
+		top_p = float("-inf")
+	"""
+
 	# compute features (embeddings if quantized already, MFCC features if raw audio)
+	dim_shape = 1024
 	for filename in tqdm(os.listdir(f'./{speaker_path}/'), desc=f"Encoding '{speaker_path.name}'", disable=not verbose):
 		extension = filename.split(".")[-1]
 		filename = filename.replace(f".{extension}", "")
 
-		if text:
+		if filename not in features:
+			continue
+
+		if similarity_backend == "text":
 			if extension not in artifact_extension:
 				raise Exception("!")
 
-			artifact = np.load(f'./{speaker_path}/{filename}.{extension}', allow_pickle=True)[()]
-			duration = artifact["metadata"]["original_length"] / artifact["metadata"]["sample_rate"]
+			_, metadata = _load_artifact(f'./{speaker_path}/{filename}.{extension}', return_metadata=True)
 
 			"""
+			duration = metadata["original_length"] / metadata["sample_rate"]
 			if 0 < min_duration and duration < min_duration:
 				continue
 			
@@ -171,11 +187,11 @@ def batch_similar_utterances(
 				continue
 			"""
 
-			lang = artifact["metadata"]["language"] if "language" in artifact["metadata"]["language"] else "en"
-			if "phonemes" in artifact["metadata"]:
-				phn = artifact["metadata"]["phonemes"]
-			elif "text" in artifact["metadata"]:
-				txt = artifact["metadata"]["text"]
+			lang = metadata["language"] if "language" in metadata["language"] else "en"
+			if "phonemes" in metadata:
+				phn = metadata["phonemes"]
+			elif "text" in metadata:
+				txt = metadata["text"]
 				phn = phonemize( txt, language=lang )
 			
 			phn = phn.replace("(en)", "")
@@ -183,34 +199,39 @@ def batch_similar_utterances(
 				phn = phn.replace(f"({metadata['language']})", "")
 
 			embedding = tts.text_embedding( phn )
-		else:
+		elif similarity_backend == "resp":
 			# treat embeddings as features, if provided quantized audio
-			if extension in artifact_extension:
-				artifact = np.load(f'./{speaker_path}/{filename}.{extension}', allow_pickle=True)[()]
-				duration = artifact["metadata"]["original_length"] / artifact["metadata"]["sample_rate"]
+			if extension not in artifact_extension:
+				continue
 
-				"""
-				if 0 < min_duration and duration < min_duration:
-					continue
-				
-				if 0 < max_duration and max_duration < duration:
-					continue
-				"""
+			qnt, metadata = _load_artifact(f'./{speaker_path}/{filename}.{extension}', return_metadata=True)
 
-				qnt = torch.from_numpy(artifact["codes"].astype(int))[0].t().to(dtype=torch.int16, device=device)
+			"""
+			duration = metadata["original_length"] / metadata["sample_rate"]
 
-				if trim_duration > 0:
-					qnt = trim( qnt, int( cfg.dataset.frames_per_second * trim_duration ) )
-				
-				embedding = tts.audio_embedding( qnt )
-			# try and extract features from the raw audio itself
+			if 0 < min_duration and duration < min_duration:
+				continue
+			
+			if 0 < max_duration and max_duration < duration:
+				continue
+			"""
+
+			if trim_duration > 0:
+				qnt = trim( qnt, int( cfg.dataset.frames_per_second * trim_duration ) )
+			
+			qnt = qnt.to(device)
+
+			embedding = tts.audio_embedding( qnt )
+		# try and extract features from the raw audio itself
+		else:
+			# qnt = tts.encode_audio(f'./{speaker_path}/{filename}', trim_length=3.0).to(device)
+			if similarity_backend == "wavlm":
+				embedding = speaker_similarity_embedding( f'./{speaker_path}/{filename}.{extension}' )
 			else:
-				# qnt = tts.encode_audio(f'./{speaker_path}/{filename}', trim_length=3.0).to(device)
 				wav, sr = load_audio( f'./{speaker_path}/{filename}.{extension}' )
 
-				duration = wav.shape[-1] / sr
-
 				"""
+				duration = wav.shape[-1] / sr
 				if 0 < min_duration and duration < min_duration:
 					continue
 				
@@ -223,6 +244,7 @@ def batch_similar_utterances(
 
 				embedding = mfcc(wav.to(device))[0].t()
 		
+		dim_shape = embedding.shape[-1]
 		if slop:
 			embedding = embedding.sum(dim=0)
 
@@ -254,10 +276,13 @@ def batch_similar_utterances(
 	top_k = min( top_k, len(keys) )
 
 	if top_k == 0:
-		return
+		top_k = len(keys)
+
+	if len(keys) == 0:
+		return None
 
 	# fill any missing keys with a null embedding to keep the order the same
-	null_embedding = torch.zeros( (1024,), device=tts.device, dtype=tts.dtype )
+	null_embedding = torch.zeros( (dim_shape,), device=tts.device, dtype=tts.dtype )
 	embeddings = torch.stack( [ feature if feature is not None else null_embedding for feature in features.values()  ] )
 	sorted_similarities = {}
 
@@ -277,12 +302,101 @@ def batch_similar_utterances(
 		similarities[index] = float("-inf")
 
 		topk = torch.topk(similarities, k=top_k, largest=True, sorted=True)
-		similarities = [ (index, keys[index], score) for index, score in zip( topk.indices.tolist(), topk.values.tolist() ) ]
+		similarities = [ (index, keys[index], score) for index, score in zip( topk.indices.tolist(), topk.values.tolist() ) if score > top_p ]
 
 		sorted_similarities[filename] = similarities
 
+	if return_features:
+		return sorted_similarities, features
 
 	return sorted_similarities
+
+"""
+# (Attempts to) group speakers based on top-k cosine similarities, by pooling together similar utterances together
+# It sort of works, but the WavLM finetuned for speaker similarities leaves some false positives without decent threshold values
+"""
+def sort_similarities(
+	path,
+	num_speakers,
+	out_path=None,
+	threshold=0.8,
+	orphan_threshold=0.6,
+):
+	from sklearn.cluster import KMeans
+
+	folders = [ "1", "2", "3", "4", "5", "6-7", "8", "9", "10", "11", "12", "14", "15" ]
+	embeddings = json_read(path / "0" / "embeddings.json")
+
+	for filename, embedding in embeddings.items():
+		embeddings[filename] = np.array(embedding)
+
+	embeddings_array = np.stack( list( embeddings.values() ) )
+	kmeans = KMeans(n_clusters=num_speakers).fit(embeddings_array)
+
+	"""
+	if not out_path:
+		out_path = path.parent / "speakers.json"
+
+	orphans = []
+	speakers = []
+
+	for filename, similarities in metadata.items():
+		target = False
+		
+		# find any existing buckets
+		for i, pool in enumerate(speakers):
+			for (idx, name, score) in similarities:
+				if score and score < threshold:
+					continue
+				if name in pool:
+					target = i
+					break
+			
+			if target != False:
+				break
+		# not found, create new bucket
+		if target == False:
+			pool = [ name for (idx, name, score) in similarities if (not score or score > threshold)  ]
+			if filename not in pool:
+				pool.append(filename)
+
+			# orphan, check later 
+			if len(pool) == 1:
+				orphans += pool
+			else:
+				speakers.append(pool)
+			continue
+
+		# insert entries into pool
+		if filename not in speakers[target]:
+			speakers[target].append(filename)
+
+		for (idx, name, score) in similarities:
+			if score and score < threshold:
+				continue
+			if name not in speakers[target]:
+				speakers[target].append(name)
+
+	# shove orphans to best scoring pool
+	for filename in orphans:
+		target = False
+		for (idx, name, score) in metadata[filename]:
+			if score and score < orphan_threshold:
+				continue
+			for i, pool in enumerate(speakers):
+				if name in pool:
+					target = i
+					break
+			if target != False:
+				continue
+
+		if target == False:
+			continue
+		
+		speakers[target].append(filename)
+	"""
+
+	json_write( speakers, out_path )
 
 def main():
 	parser = argparse.ArgumentParser()
@@ -292,17 +406,20 @@ def main():
 	parser.add_argument("--use-dataset", action="store_true")
 
 	parser.add_argument("--yaml", type=Path)
-	parser.add_argument("--text", action="store_true")
+	parser.add_argument("--out-path", type=Path, default=None)
 	# dropped, because this might mess with the indices to map to
 	"""
 	parser.add_argument("--trim-duration", type=float, default=3.0)
 	parser.add_argument("--min-duration", type=float, default=0)
 	parser.add_argument("--max-duration", type=float, default=0)
 	"""
-	parser.add_argument("--storage-backend", type=str, default="slop")
 	parser.add_argument("--top-k", type=int, default=8)
+	parser.add_argument("--top-p", type=float, default=0.5)
 
+	parser.add_argument("--storage-backend", type=str, default="slop")
+	parser.add_argument("--similarity-backend", type=str, default="resp")
 	parser.add_argument("--audio-backend", type=str, default="encodec")
+
 	parser.add_argument("--dtype", type=str, default="float16")
 	parser.add_argument("--amp", action="store_true")
 	parser.add_argument("--device", type=str, default="cuda")
@@ -333,24 +450,29 @@ def main():
 			if args.skip_existing and metadata_keys and "similar" in metadata[metadata_keys[-1]]:
 				return
 
-			similarities = batch_similar_utterances(
-				speaker_path=cfg.data_dir / speaker_name,
-				yaml=args.yaml,
-				text=args.text,
-				top_k=args.top_k,
-				#trim_duration=args.trim_duration,
-				#min_duration=args.min_duration,
-				#max_duration=args.max_duration,
-				storage_backend=args.storage_backend,
-				metadata_keys=metadata_keys,
+			try:
+				similarities = batch_similar_utterances(
+					speaker_path=cfg.data_dir / speaker_name,
+					yaml=args.yaml,
+					top_k=args.top_k,
+					top_p=args.top_p,
+					#trim_duration=args.trim_duration,
+					#min_duration=args.min_duration,
+					#max_duration=args.max_duration,
+					audio_backend=args.audio_backend,
+					storage_backend=args.storage_backend,
+					similarity_backend=args.similarity_backend,
 
-				audio_backend=args.audio_backend,
-				device=args.device,
-				dtype=args.dtype,
-				amp=args.amp,
+					metadata_keys=metadata_keys,
 
-				verbose=True,
-			)
+					device=args.device,
+					dtype=args.dtype,
+					amp=args.amp,
+
+					verbose=True,
+				)
+			except Exception as e:
+				similarities = None
 			
 			if not similarities:
 				return
@@ -381,28 +503,39 @@ def main():
 			add( data_dir, type="noise", texts=False )
 
 	elif args.input_speaker:
-		similarities = batch_similar_utterances(
+		similarities, features = batch_similar_utterances(
 			speaker_path=args.input_speaker,
 			yaml=args.yaml,
-			text=args.text,
 			top_k=args.top_k,
-			
+			top_p=args.top_p,
+
 			#trim_duration=args.trim_duration,
 			#min_duration=args.min_duration,
 			#max_duration=args.max_duration,
 
-			audio_backend=args.audio_backend,
 			device=args.device,
 			dtype=args.dtype,
 			amp=args.amp,
 
+			audio_backend=args.audio_backend,
 			storage_backend=args.storage_backend,
+			similarity_backend=args.similarity_backend,
+
 			verbose=True,
+			return_features=True,
 		)
 
-		# and print
-		for filename, sim in similarities.items():
-			print(f'{filename}: {sim}')
+		if args.out_path is not None:
+			features_json = {}
+			for k, v in features.items():
+				features_json[k] = [ x.item() for x in v ]
+
+			json_write( similarities, args.out_path / "similarities.json" )
+			json_write( features_json, args.out_path / "embeddings.json" )
+		else:
+			# and print
+			for filename, sim in similarities.items():
+				print(f'{filename}: {sim}')
 	else:
 		raise Exception("!")
 

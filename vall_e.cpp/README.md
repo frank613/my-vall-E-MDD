@@ -19,6 +19,7 @@ Run `make`.
 [`encodec.cpp`](https://github.com/PABannier/encodec.cpp) requires updating its GGML copy to the latest version, which requires a few lines to get the CPU backend working (per my [fork](https://github.com/e-c-k-e-r/encodec.cpp)).
 
 [`llama.cpp`](https://github.com/ggerganov/llama.cpp) only possible modification needs to ensure that a non-causal attention mask is used; everything necessary can be hacked together with clever tricks.
+* initially written on commit `9ba399dfa7f115effc63d48e6860a94c9faa31b2`, updated to commit `7a84777f42a9b3ba47db5d20b7662f8ddf92f652`
 
 ## To-Do
 
@@ -39,6 +40,7 @@ Run `make`.
 	* [x] `AR` sampling
 * [x] working `NAR-len` output
 	* [x] `NAR-len` sampling
+	* [ ] proper scoring
 * [x] working `NAR` output
 	* [x] `NAR` sampling
 * [x] decode audio to disk

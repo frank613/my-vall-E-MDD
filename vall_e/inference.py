@@ -14,10 +14,10 @@ from pathlib import Path
 from tqdm import tqdm, trange
 
 from .emb import g2p, qnt
-from .emb.qnt import trim, trim_random, unload_model, repeat_extend_audio
+from .emb.qnt import trim, trim_random, unload_model, repeat_extend_audio, AVAILABLE_AUDIO_BACKENDS
 from .emb.transcribe import transcribe
 
-from .utils import to_device, set_seed, clamp, wrapper as ml
+from .utils import to_device, set_seed, clamp, ml
 
 from .config import cfg, Config
 from .models import get_models
@@ -60,6 +60,11 @@ class TTS():
 
 		cfg.format( training=False )
 		cfg.dataset.use_hdf5 = False # could use cfg.load_hdf5(), but why would it ever need to be loaded for inferencing
+
+		# fallback to encodec if no vocos
+		if cfg.audio_backend == "vocos" and "vocos" not in AVAILABLE_AUDIO_BACKENDS:
+			_logger.warning("Vocos requested but not available, falling back to Encodec...")
+			cfg.set_audio_backend(cfg.audio_backend)
 
 		if amp is None:
 			amp = cfg.inference.amp
@@ -306,7 +311,7 @@ class TTS():
 			seed = set_seed(seed)
 			batch_size = len(texts)
 			input_kwargs = dict(
-				text_list=texts,
+				phns_list=texts,
 				proms_list=proms,
 				lang_list=langs,
 				disable_tqdm=not use_tqdm,
@@ -385,7 +390,9 @@ class TTS():
 			text = transcribe( voice_convert, model_name="openai/whisper-base", align=False )["text"]
 		
 		lines = sentence_split(text, split_by=sampling_kwargs.get("split_text_by", "sentences"))
-
+		if not lines:
+			lines = [""]
+			
 		wavs = []
 		sr = None
 
@@ -421,8 +428,8 @@ class TTS():
 			with torch.autocast(self.device, dtype=dtype, enabled=amp):
 				model = model_ar if model_ar is not None else model_nar
 				if model is not None:
-					text_list = model(
-						text_list=None, proms_list=[resp], lang_list=[lang], resps_list=[resp], task_list=[task],
+					phns_list = model(
+						phns_list=None, proms_list=[resp], lang_list=[lang], resps_list=[resp], task_list=[task],
 						disable_tqdm=not use_tqdm,
 						use_lora=use_lora,
 						**sampling_kwargs,
@@ -430,9 +437,9 @@ class TTS():
 				else:
 					raise Exception("!")
 				
-				text_list = [ cfg.tokenizer.decode( text ).replace("   ", "_").replace(" ", "").replace("_", " ") for text in text_list ]
+				phns_list = [ cfg.tokenizer.decode( text ).replace("   ", "_").replace(" ", "").replace("_", " ") for text in phns_list ]
 
-			return text_list[0]
+			return phns_list[0]
 		elif task in ["phn", "un-phn"]:
 			lang = self.encode_lang( language )
 			lang = to_device(lang, device=self.device, dtype=torch.uint8)
@@ -440,17 +447,17 @@ class TTS():
 			with torch.autocast(self.device, dtype=dtype, enabled=amp):
 				model = model_ar if model_ar is not None else model_nar
 				if task == "phn":
-					text_list = None
-					raw_text_list = [ self.encode_text( text, phonemize=False ).to(device=self.device, dtype=torch.int16) ]
+					phns_list = None
+					text_list = [ self.encode_text( text, phonemize=False ).to(device=self.device, dtype=torch.int16) ]
 					output_tokenizer = cfg.tokenizer
 				else:
-					text_list = [ self.encode_text( text ).to(device=self.device, dtype=torch.int16) ]
-					raw_text_list = None
+					phns_list = [ self.encode_text( text ).to(device=self.device, dtype=torch.int16) ]
+					text_list = None
 					output_tokenizer = cfg.text_tokenizer
 
 				if model is not None:
-					text_list = model(
-						text_list=text_list, raw_text_list=raw_text_list, lang_list=[lang], task_list=[task],
+					phns_list = model(
+						phns_list=phns_list, text_list=text_list, lang_list=[lang], task_list=[task],
 						disable_tqdm=not use_tqdm,
 						use_lora=use_lora,
 						**sampling_kwargs,
@@ -458,9 +465,9 @@ class TTS():
 				else:
 					raise Exception("!")
 				
-				text_list = [ output_tokenizer.decode( text ).replace("   ", "_").replace(" ", "").replace("_", " ") for text in text_list ]
+				phns_list = [ output_tokenizer.decode( text ).replace("   ", "_").replace(" ", "").replace("_", " ") for text in phns_list ]
 
-			return text_list[0]
+			return phns_list[0]
 
 
 		# stuff for rolling context
@@ -504,8 +511,8 @@ class TTS():
 
 			with torch.autocast(self.device, dtype=dtype, enabled=amp):
 				input_kwargs = dict(
-					text_list=[phns] if phonemize else None,
-					raw_text_list=[phns] if not phonemize else None,
+					phns_list=[phns] if phonemize else None,
+					text_list=[phns] if not phonemize else None,
 					proms_list=[prom],
 					lang_list=[lang],
 					disable_tqdm=not use_tqdm,
@@ -519,6 +526,9 @@ class TTS():
 						len_list = [ vc_utterance.shape[0] ]
 					else:					
 						len_list = model_len( **input_kwargs, task_list=["len"], **{"max_duration": 5} ) # "max_duration" is max tokens
+
+						# clamp
+						len_list = [ max( l, 1 * cfg.dataset.frames_per_second ) for l in len_list ]
 
 						# add an additional X seconds
 						len_list = [ int(l * duration_padding) for l in len_list ]
@@ -548,7 +558,12 @@ class TTS():
 					)
 				else:
 					raise Exception("!")
-
+				"""
+				len_list = [ 3 * cfg.dataset.frames_per_second ]
+				resps_list = model_nar( **input_kwargs, len_list=len_list, task_list=["tts"],
+					**(sampling_kwargs),
+				)
+				"""
 
 			# to-do: care about batching later
 			resps = resps_list[0]

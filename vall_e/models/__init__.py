@@ -81,11 +81,18 @@ def get_model(config, training=True, is_mdd=False, **model_kwargs):
 		)
   
 	else:
-		from .nar_mdd import AR_NAR_MDD # extended for MDD
-		name = config.name
-		model = AR_NAR_MDD(
-			n_text_tokens=config.text_tokens,
+		# crunge
+		if config.version < 7:
+			from .ar_nar import AR_NAR 
+			ModelClass = AR_NAR
+		else:
+			from .ar_nar_v2 import AR_NAR_V2
+			ModelClass = AR_NAR_V2
+
+		cfg_kwargs = dict(
+			n_phn_tokens=config.phoneme_tokens,
 			n_audio_tokens=config.audio_tokens,
+			n_text_tokens=config.text_tokens,
 			d_model=config.dim,
 			n_heads=config.heads,
 			n_layers=config.layers,
@@ -97,8 +104,10 @@ def get_model(config, training=True, is_mdd=False, **model_kwargs):
 			
 			training = training,
 			config = config,
-			**model_kwargs
 		)
+
+		name = config.name
+		model = ModelClass(**(cfg_kwargs | model_kwargs))
 	_logger.info(f"{name} ({next(model.parameters()).dtype}): {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters")
 
 	return model

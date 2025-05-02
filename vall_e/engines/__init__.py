@@ -1,6 +1,6 @@
 from ..config import cfg
 
-from ..utils.distributed import fix_unset_envs, ddp_model, world_size
+from ..utils.distributed import fix_unset_envs, ddp_model, world_size, global_rank
 fix_unset_envs()
 
 if cfg.trainer.backend == "deepspeed":
@@ -11,7 +11,7 @@ elif cfg.trainer.backend == "local":
 from .base import Engines, TrainFeeder, default_feeder, Engine as LocalEngine
 
 from ..models import get_models, get_model
-from ..utils import wrapper as ml
+from ..utils import ml
 from ..utils.io import torch_save, torch_load, pick_path
 from ..models.lora import apply_lora, lora_load_state_dict
 
@@ -61,7 +61,7 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 
 		# to handle the issue of training with deepspeed, but inferencing with local
 		if checkpoint_path.exists() and backend == "local":
-			tag = open(checkpoint_path).read()
+			tag = open(checkpoint_path).read().strip()
 			checkpoint_path = pick_path( checkpoint_path.parent / tag / f"state.{cfg.weights_format}", *[ f'.{format}' for format in cfg.supported_weights_formats] )
 
 		# if loaded using --model=
@@ -115,7 +115,6 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 				"lr": cfg.hyperparameters.learning_rate,
 			}
 
-
 			if cfg.hyperparameters.optimizer.lower() == "adamw":
 				params["betas"] = (0.9, 0.96)
 				params["eps"] = 1e-07
@@ -145,8 +144,21 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 					"update_proj_gap": 1,
 					"proj_type": "std",
 				})
+			elif cfg.hyperparameters.optimizer.lower() == "adafactor":
+				optimizer_class = ml.Adafactor
 			elif cfg.hyperparameters.optimizer.lower() == "adagrad":
 				optimizer_class = ml.Adagrad
+			elif cfg.hyperparameters.optimizer.lower() == "muon":
+				optimizer_class = ml.Muon
+
+				muon_params = [ param for name, param in model.model.named_parameters() if param.ndim >= 2 ]
+				adamw_params = [ param for name, param in model.model.named_parameters() if param.ndim < 2 ]
+				adamw_params += [ param for name, param in model.named_parameters() if not name.startswith('model.') ]
+
+				params["params"] = [
+					{ "params": muon_params, "muon": True },
+					{ "params": adamw_params, "muon": False, "betas": (0.95, 0.95), "eps": 1e-8 },
+				]
 			else:
 				raise ValueError(f'Optimizer specified not implemented: {cfg.hyperparameters.optimizer}')
 
@@ -166,10 +178,32 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 					lr = params['lr'],
 					warmup_steps = cfg.hyperparameters.warmup_steps
 				)
+			elif cfg.hyperparameters.scheduler:
+				scheduler_kwargs = {}
+				if cfg.hyperparameters.scheduler.lower() == "onecycle":
+					scheduler_class = ml.OneCycleLR
+					scheduler_kwargs["max_lr"] = params['lr']
+				elif cfg.hyperparameters.scheduler.lower() == "cosineannealing":
+					scheduler_class = ml.CosineAnnealingLR
+				elif cfg.hyperparameters.scheduler.lower() == "noam":
+					scheduler_class = ml.NoamLR
+					scheduler_kwargs["d_model"] = model.d_model
+					scheduler_kwargs["warmup_steps"] = cfg.hyperparameters.warmup_steps
+				elif cfg.hyperparameters.scheduler.lower() == "warmup":
+					scheduler_class = ml.WarmupLR
+					scheduler_kwargs["warmup_steps"] = cfg.hyperparameters.warmup_steps
+				else:
+					raise ValueError(f'Scheduler specified not implemented: {cfg.hyperparameters.scheduler}')
 
-		"""
-		# set up our LR scheduler here
-		"""
+				scheduler_kwargs.update(cfg.hyperparameters.scheduler_params)
+				lr_scheduler = scheduler_class(
+					optimizer,
+					**scheduler_kwargs,
+				)
+			"""
+			# set up our LR scheduler here
+			"""
+
 
 		if inferencing:
 			optimizer = None
@@ -204,101 +238,13 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 			for k in erase:
 				del state[k]
 
-			# converts an AR+NAR model into an AR+NAR-len model
-			"""
-			if True:
-				# move STT one over
-				state['classifiers.proj.9.weight'] = state['classifiers.proj.8.weight'].clone()
-				state['classifiers.proj.9.bias'] = state['classifiers.proj.8.bias'].clone()
-				# copy from AR:0:0 classifier
-				if True:
-					state['classifiers.proj.8.weight'] = state['classifiers.proj.0.weight'].clone()
-					state['classifiers.proj.8.bias'] = state['classifiers.proj.0.bias'].clone()
-					# copy from AR:0:0 embeddings
-					state['resps_emb.embeddings.8.weight'] = state['resps_emb.embeddings.0.weight'].clone()
-				# remove
-				else:
-					if 'classifiers.proj.8.weight' in state:
-						del state['classifiers.proj.8.weight']
-					if 'classifiers.proj.8.bias' in state:
-						del state['classifiers.proj.8.bias']
-					if 'resps_emb.embeddings.8.weight' in state:
-						del state['resps_emb.embeddings.8.weight']
-			"""
-
 			# resize modules if I'm doing experiments and can't be assed to manually trim things
 			if cfg.trainer.resize_modules:
-				uses_stop_token = 1 if ("ar" in model.capabilities or "len" in model.capabilities) > 0 else 0
-				keys = [
-					("text_emb.weight", model.config.text_tokens ),
-					("tasks_emb.weight", model.config.tasks ),
-					("langs_emb.weight", model.config.langs ),
-					("rvq_l_emb.weight", model.config.resp_levels ),
-					("resps_emb.embeddings.0.weight", model.config.audio_tokens + uses_stop_token ),
-					("model.embed_tokens.weight", model.config.audio_tokens + uses_stop_token ),
-					("classifiers.proj.0.weight", model.config.audio_tokens + uses_stop_token ),
-					("classifiers.proj.0.bias", model.config.audio_tokens + uses_stop_token ),
-					("classifier.weight", model.n_vocab ),
-					("classifier.bias", model.n_vocab ),
-				]
-
-				# correcting an oversight
-				if model.config.experimental.split_classifiers and "len" in model.capabilities:
-					len_idx, nar_0_idx = model.classifiers.indices(["len", "NAR:0:0"])
-					keys.append((f"classifiers.proj.{len_idx}.weight", 11))
-					keys.append((f"classifiers.proj.{len_idx}.bias", 11))
-
-					keys.append((f"classifiers.proj.{nar_0_idx}.weight", 1024))
-					keys.append((f"classifiers.proj.{nar_0_idx}.bias", 1024))
-
+				keys = []
 				for k, tokens in keys:
 					if k not in state:
 						continue
 					state[k] = ml.resize_weight( state[k], tokens )
-
-			# stuff to inject new layers into an existing model train over (not recommended, it doesnt amount to anything)
-			"""
-			if True:
-				remapped_dict = {}
-				remapped_indices = [
-					(0, 1),
-					(1, 2),
-					(2, 3),
-					(3, 5),
-					(4, 6),
-					(5, 7),
-					(6, 9),
-					(7, 10),
-					(8, 11),
-					(9, 13),
-					(10, 14),
-					(11, 15),
-				]
-
-				for src, dst in remapped_indices:
-					remapped_dict[f"model.layers.{dst}.input_layernorm.weight"] = state[f"model.layers.{src}.input_layernorm.weight"]
-					remapped_dict[f"model.layers.{dst}.self_attn.k_proj.weight"] = state[f"model.layers.{src}.self_attn.k_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.self_attn.q_proj.weight"] = state[f"model.layers.{src}.self_attn.q_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.self_attn.v_proj.weight"] = state[f"model.layers.{src}.self_attn.v_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.self_attn.o_proj.weight"] = state[f"model.layers.{src}.self_attn.o_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.post_attention_layernorm.weight"] = state[f"model.layers.{src}.post_attention_layernorm.weight"]
-					remapped_dict[f"model.layers.{dst}.mlp.down_proj.weight"] = state[f"model.layers.{src}.mlp.down_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.mlp.gate_proj.weight"] = state[f"model.layers.{src}.mlp.gate_proj.weight"]
-					remapped_dict[f"model.layers.{dst}.mlp.up_proj.weight"] = state[f"model.layers.{src}.mlp.up_proj.weight"]
-
-					del state[f"model.layers.{src}.input_layernorm.weight"]
-					del state[f"model.layers.{src}.self_attn.k_proj.weight"]
-					del state[f"model.layers.{src}.self_attn.q_proj.weight"]
-					del state[f"model.layers.{src}.self_attn.v_proj.weight"]
-					del state[f"model.layers.{src}.self_attn.o_proj.weight"]
-					del state[f"model.layers.{src}.post_attention_layernorm.weight"]
-					del state[f"model.layers.{src}.mlp.down_proj.weight"]
-					del state[f"model.layers.{src}.mlp.gate_proj.weight"]
-					del state[f"model.layers.{src}.mlp.up_proj.weight"]
-
-				for k, v in remapped_dict.items():
-					state[k] = v
-			"""
 
 			model.load_state_dict(state, strict=cfg.trainer.strict_loading)
 
@@ -360,21 +306,35 @@ def load_engines(training=True, is_mdd=False, **model_kwargs):
 			engine.module.eval()
 
 		# setup wandb
+		if engine._training and cfg.trainer.wandb and wandb is not None:
+			key_name = name
+			if cfg.lora is not None:		
+				key_name = cfg.lora.full_name
 
-		# if engine._training and cfg.trainer.wandb and wandb is not None:
-		# 	key_name = name
-		# 	kwargs = {}
-		# 	if cfg.lora is not None:			
-		# 		key_name = cfg.lora.full_name
+			salt = cfg.trainer.wandb_params.pop("salt", "-run")
+			kwargs = {
+				'id': f'{key_name}{salt}',
+				'resume': 'allow',
+				"config": dict(
+					config = engine.hyper_config.__dict__,
+					hyperparameters = cfg.hyperparameters.__dict__,
+				),
+			}
+			
+			if world_size() > 1:
+				kwargs |= {
+					"id": f'{key_name}{salt}-{global_rank()}',
+					"group": f"DDP{salt}",
+				}
 
-		# 	if world_size() > 1:
-		# 		kwargs["group"] = "DDP"
+			kwargs.update( cfg.trainer.wandb_params )
 
-		# 	engine.wandb = wandb.init(project=key_name, **kwargs)
-		# 	engine.wandb.watch(engine.module)
-		# else:
-		# 	engine.wandb = None
-		if cfg.trainer.wandb:
-			sys.exit("wandb is not supported in this version")
+			try:
+				engine.wandb = wandb.init(project=key_name, **kwargs)
+				engine.wandb.watch(engine.module)
+			except Exception as e:	
+				engine.wandb = None
+		else:
+			engine.wandb = None
 
 	return engines

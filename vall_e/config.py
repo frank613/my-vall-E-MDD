@@ -117,10 +117,28 @@ class BaseConfig:
 
 		# load state dict and copy its stored model config
 		model_kwargs = { "attention": "auto", "training": False, "teacher": False }
-		model_state_dict = [ torch_load( model_path )["config"] | { "path": model_path } | model_kwargs ] if model_path and model_path.exists() else []
-		lora_state_dict = [ torch_load( lora_path )["config"] | { "path": lora_path } ] if lora_path and lora_path.exists() else []
 
-		state = { "models": model_state_dict, "loras": lora_state_dict, "trainer": { "load_state_dict": True } }
+		model_state_dict = torch_load( model_path ) if model_path and model_path.exists() else None
+		lora_state_dict = torch_load( lora_path ) if lora_path and lora_path.exists() else None
+
+		models_config = [ model_state_dict["config"] | { "path": model_path } | model_kwargs ] if model_state_dict is not None else []
+		loras_config = [ lora_state_dict["config"] | { "path": lora_path } ] if lora_state_dict is not None else []
+
+		state = { "models": models_config, "loras": loras_config, "trainer": { "load_state_dict": True } }
+
+		deduced_backend = None
+		if model_state_dict is not None:
+			# 9 audio levels, will always be DAC
+			if "proms_emb.embs.8.weight" in model_state_dict["module"]:
+				deduced_backend = "dac"
+			# 8 audio levels, may be encodec/vocos (1024 tokens) or nemo (1000 tokens)
+			elif "proms_emb.embs.7.weight" in model_state_dict["module"]:
+				deduced_backend = "nemo" if model_state_dict["module"]["proms_emb.embs.7.weight"].shape[0] == 1000 else "vocos"
+		
+		if deduced_backend:
+			_logger.info(f'Deduced audio backend: {deduced_backend}')
+			state["audio_backend"] = deduced_backend
+
 		return cls(**state)
 
 	@classmethod
@@ -169,6 +187,7 @@ class Dataset:
 	use_metadata: bool = False # use genretaed metadata to aid in dataset loading
 	
 	validate: bool = True # validate each utterance on wheter it can be included based on duration range caps
+	strict_validate: bool = False # so far only governs if a path actually exists within the dataset, as this can be a bit slow (and shouldn't really happen normally)
 	workers: int = 8 # number of dataloader workers to spawn
 	cache: bool = True # use diskcache to cache the dataset
 
@@ -217,6 +236,9 @@ class Dataset:
 			if cfg.sample_rate == 16_000:
 				return 50
 		
+		if cfg.audio_backend == "nemo":
+			return 86.1
+		
 		# 24Khz Encodec / Vocos and incidentally DAC are all at 75Hz
 		return 75
 
@@ -234,16 +256,18 @@ class Dataset:
 		return self.duration_range[1]
 
 # collection of experimental variables that should not be tampered with unless you know what you're doing
+# to-do: clean this up
 @dataclass()
 class ModelExperimentalSettings:
-	hf: bool = False # strictly utilizes a HF model and handles converting input IDs / outputs accordingly
-	interleave: bool = False # use an interleaved AR rather than a split AR + NAR (worse performance and results due to everything being causal)
+	hf: bool = False # unused, strictly utilizes a HF model and handles converting input IDs / outputs accordingly
+	interleave: bool = False #  unused, use an interleaved AR rather than a split AR + NAR (worse performance and results due to everything being causal)
 	split_classifiers: bool = False # each RVQ level gets its own classifier / output proj / LM head rather than sharing one for all RVQ levels (to-do: also split for text/prom)
 	audio_embedding_sums: bool = False # whether each pass uses the previous RVQ codes or only the current level
 	# a model trained not summing audio embeddings *can* have this enabled without any apparent issues
 	# a model trained to sum *cannot* have this disabled without any apparent issues, or at least the ar+nar-retnet-8 can't.
 	# in theory a model that is trained to sum embeddings can peform better due to "seeing" previous levles (due to the R in RVQ standing for residuals...), but in practice it seems fine to not do so
-	audio_embedding_mode: str | None = None # None | "exclusive" | "inclusive", subjugates the audio backend's encoding/decoding model for embeddings
+	
+	audio_embedding_mode: str | None = None # None | "exclusive" | "inclusive", subjugates the audio backend's encoding/decoding model for embeddings, currently not used
 	kv_heads: int = 0 # MHA or GQA (for supported backends)
 	rvq_levels_p: str | list = "auto" # determines odds of selecting RVQ levels when training, "equal" will make each level equally likely
 	rvq_level_range: list = field(default_factory=lambda: []) # some cringe to try and limit the RVQ training range for LoRAs, isn't necesary
@@ -267,16 +291,52 @@ class ModelExperimentalSettings:
 	classifiers_bias: bool = True # base LLaMAs do not bias the output heads, but my existing weights do
 	max_position_embeddings: int = 70 * 65 * 5 # 5 minutes of audio
 
-	# these technically should be as hyperparameters
+	resp_parallel_training: bool = True # used for version >= 7, computes loss for ALL quant levels rather than the randomly selected one
+	# this should allow for "faster" training as each sample is trained entirely, but slower backwards (and possibly less stable training, maybe)
+	monolithic_audio_encoder: bool = False # combines the prom/resp embeddings into one unit
+	# this usually sounds bad, as the model can "extract" features from the prom separate from the ones in the resp
+	predict_causally: bool = False # predicts the next token even for the non-causal/NAR tasks, in theory this should also bolster the model, as
+	# * NAR-demask would semi-doubly train for AR
+	# * the model wouldn't also need to learn when to predict the token in place
+	len_parallel_training: bool = True # used for version >= 7, computes len loss alongside normal training through using the input sequence (surely nothing can go wrong)
+	len_use_logits: bool = False # whether to treat duration prediction as a nll/logits task or use a raw, continuous float
+	len_loss_factor: float = 0.00001 # loss factor for len calculation, very small because it mucks up loss scaling under float16
+	parallel_attention_mask_dropout: float = 0.0 # randomly sets to a causal attention mask when training NAR-len demasking
+	layer_dropout_p: float = 0.0 # performs layer dropout, which I readded because it might actually help since the reference model had this at 0.1
+	codebook_dropout_p: float = 0.0 # perform codebook dropout, which I added as an explicit feature since it seems the reference model had this in a way
+	# although I don't know how I could easily implement this for the new implementation
+
+	logit_normalization: float = 0 # performs logit normalization against the norms per the paper (https://arxiv.org/abs/2205.09310) per https://arxiv.org/abs/2406.05298 (this actually is very bad)
+	per_level_normalization: bool = True # moves the final norm out from the underlying model into the decoder
+	audio_level_loss_factors: list[float] | str = "auto" # the loss factors per-level when training
+	# "auto" will pick best for codec
+	# "decreasing" will do the RVQ strat (prioritize lower levels)
+	# "normal" will do the FSQ strat (prioritize midrange)
+	# "equal" or "none" will set do no leveling
+	# list of floats to manually set
+	use_segmented_attention_mask: bool = False # instead of naively using a full attention mask, use one where each segment cannot attend after itself
+	# this is a flag since I am cautious
+	use_sliding_attention_mask: bool = False # when used with above, applies a sliding mask within the current segment
+	# this is a flag since I am cautious
+	use_streamlined_calc_loss: bool = False # explicitly request the faster pathway for loss calc, in case doing loss one by one instead of one batch is a bottleneck
+	use_audio_encoder_level_weights: bool = True # flag to maintain backwards compat
+	use_audio_encoder_ffn: bool = True # 
+	use_audio_encoder_norm: bool = True # 
+	audio_decoder_ffn_expansion_size: int = 2 # need to do something awful with this
+	audio_encoder_ffn_expansion_size: int = 2 # need to do something awful with this
+
 	# performs token dropout to compensate for errors
+	# currently unused, since this might be the wrong way to go about it
 	token_dropout_error: float = 0.0 # probability to nudge a token by ±1
 	token_dropout_rate: float = 0.0 # probability to randomly set a token to a special dropout value
 	token_dropout_rvq_levels: list = field(default_factory=lambda: [1,8]) # determines which levels to do dropout, by default do not do dropout on RVQ level 0
-	# these technically should be as hyperparameters
+
 	# classifier-free guidance training settings
+	# too large might actually be a problem
 	cfg_cond_dropout_p: float = 0.0 # 0.2 # probability to drop out text and audio during training
-	cfg_text_dropout_p: float = 0.0 # 0.0  # probability to drop out input audio prompt during training
-	cfg_prom_dropout_p: float = 0.0 # 0.3  # probability to drop out input audio prompt during training
+	cfg_text_dropout_p: float = 0.0 # 0.0 # probability to drop out input audio prompt during training
+	cfg_prom_dropout_p: float = 0.0 # 0.3 # probability to drop out input audio prompt during training
+	lang_cond_dropout_p: float = 0.0 # probability to drop out language token during training
 
 	use_raw_text_p: float = 0.0 # probability to use raw text as the input prompt instead
 
@@ -293,7 +353,6 @@ class Model:
 	name: str = "ar+nar" # vanity name for the model
 	version: int = 5 # 1 = old with MultiEmbedding, 2 = new with AudioEmbedding, 3+ = additional embeddings
 	size: str | dict = "full" # preset string or explicitly defined dimensionality
-	resp_levels: int = 8 # RVQ-bin levels this model supports
 	tasks: int = 8 # ["tts", "ns", "sr", "tse", "cse", "nse"] and leaves two more for anything else I want (like "svc") (unused)
 	langs: int = 1 # defined languages (semi-unused)
 	tones: int = 1 # defined tones (unsued)
@@ -317,7 +376,7 @@ class Model:
 		return [ self ] if not name or self.name == name else []
 	
 	def loss_factor(self, k):
-		return self.loss_factors.get(k, 0.0)
+		return self.loss_factors.get(k, 1.0)
 
 	@property
 	def max_levels(self):
@@ -336,7 +395,7 @@ class Model:
 		name = [ self.name ]
 		
 		if isinstance(self.size, dict):
-			if hasattr(self.size, "label") and self.size['label']:
+			if self.size.get('label'):
 				name.append(f"{self.size['label']}")
 		elif isinstance(self.size, str) and self.size not in ["full","extended"]:
 			name.append(self.size)
@@ -358,20 +417,40 @@ class Model:
 		return self.audio_tokens
 
 	@property
+	def resp_levels(self):
+		if isinstance(self.size, dict) and "resp_levels" in self.size:
+			return self.size['resp_levels']
+		
+		if cfg.audio_backend == "dac":
+			return 9
+
+		return 8
+
+	@property
 	def audio_tokens(self):
-		if isinstance(self.size, dict) and hasattr(self.size, "audio_tokens"):
+		if isinstance(self.size, dict) and "audio_tokens" in self.size:
 			return self.size['audio_tokens']
+		
+		if cfg.audio_backend == "nemo":
+			return 1000
+
 		return 1024
 
 	@property
 	def text_tokens(self):
-		if isinstance(self.size, dict) and hasattr(self.size, "text_tokens"):
+		if isinstance(self.size, dict) and "text_tokens" in self.size:
 			return self.size['text_tokens']
+		return 8575
+
+	@property
+	def phoneme_tokens(self):
+		if isinstance(self.size, dict) and "phoneme_tokens" in self.size:
+			return self.size['phoneme_tokens']
 		return 256
 
 	@property
 	def dim(self):
-		if isinstance(self.size, dict) and hasattr(self.size, "dim"):
+		if isinstance(self.size, dict) and "dim" in self.size:
 			return self.size['dim']
 
 		if isinstance(self.size, float):
@@ -384,8 +463,15 @@ class Model:
 		return 1024
 
 	@property
+	def embed_dim(self):
+		if isinstance(self.size, dict) and "embed_dim" in self.size:
+			return self.size['embed_dim']
+
+		return self.dim
+
+	@property
 	def heads(self):
-		if isinstance(self.size, dict) and hasattr(self.size, "heads"):
+		if isinstance(self.size, dict) and "heads" in self.size:
 			return self.size['heads']
 
 		if isinstance(self.size, float):
@@ -399,7 +485,7 @@ class Model:
 
 	@property
 	def layers(self):
-		if isinstance(self.size, dict) and hasattr(self.size, "layers"):
+		if isinstance(self.size, dict) and "layers" in self.size:
 			return self.size['layers']
 
 		if self.size == "double":
@@ -407,6 +493,13 @@ class Model:
 		if self.size == "extended":
 			return 16
 		return 12
+
+	@property
+	def ffn(self):
+		if isinstance(self.size, dict) and "ffn" in self.size:
+			return self.size['ffn']
+		
+		return 4
 
 	@property
 	def activation_checkpointing(self):
@@ -472,7 +565,6 @@ class Hyperparameters:
 	warmup_steps: int = 0 # number of steps to warm up the optimizer before performing updates, I think, this is just passed to deepspeed
 
 	scheduler: str = "" # scheduler to use, currently don't ever use one so this doesn't really matter
-	scheduler_type: str = "" # deprecated
 	scheduler_params: dict = field(default_factory=lambda: {}) # to pass through deepspeed config
 
 	autotune: bool = False # to do deepspeed's autotuning
@@ -523,16 +615,19 @@ class Evaluation:
 
 @dataclass()
 class DeepSpeed:
-	zero_optimization_level: int = 0 # doesn't seem to work
+	zero_optimization_level: int = 0
 	use_compression_training: bool = False # cope
 	compression_bits: int = 8 # cope
 	inferencing: bool = False # for using DeepSpeed's inferencing wrapper instead
 	optimizer: bool = True # use DeepSpeed optimizer wrapper
 	amp: bool = False # use DeepSpeed's AMP (requires some other package installed apparently)
 
-	loss_scale_window: int = 100
-	min_loss_scale: float = 8192.0
+	loss_scale_window: int = 1000
+	min_loss_scale: float = 32768.0
+	max_loss_scale: float = 1048576.0
+	loss_scale = 0.0
 
+	profile: bool = False
 	config: dict = field(default_factory=lambda: {}) # to pass through deepspeed config
 
 	@cached_property
@@ -550,6 +645,12 @@ class DeepSpeed:
 			scheduler_params['total_num_steps'] = cfg.trainer.iterations
 
 		autotune_params = cfg.hyperparameters.autotune_params
+
+		profiler_path = str( cfg.rel_path / "profiler.log" )
+		
+		ds_cfg_path = cfg.rel_path / "ds_config.json"
+		if not ds_cfg_path.exists():
+			ds_cfg_path = Path("./data/ds_config.json")
 
 		if "enabled" not in autotune_params:
 			autotune_params['enabled'] = True
@@ -583,9 +684,9 @@ class DeepSpeed:
 			"fp16": {
 				"enabled": cfg.trainer.weight_dtype.lower() == "float16",
 				"auto_cast": True, # ???
-				"loss_scale_window": self.loss_scale_window, # raise every 100 consecutive good steps
-				"min_loss_scale": self.min_loss_scale, # loss scale hitting 8K fries the model, 16K is fine but 32K is comfy
-				"loss_scale": 0.0 if cfg.trainer.scale_loss else 1.0,
+				"loss_scale_window": self.loss_scale_window,
+				"min_loss_scale": self.min_loss_scale,
+				"loss_scale": self.loss_scale if cfg.trainer.scale_loss else 1.0, # use defined loss scale (defaults to 0, which is dynamic) if requested, or 1.0 (none) if not
 			},
 			"bf16": {
 				"enabled": cfg.trainer.weight_dtype.lower() == "bfloat16",
@@ -648,27 +749,27 @@ class DeepSpeed:
 			} if self.use_compression_training else None,
 			"zero_optimization": {
 				"stage": self.zero_optimization_level,
+				"allgather_partitions": True,
 				"contiguous_gradients": True,
 				"overlap_comm": True,
 				"reduce_scatter": True,
-				"reduce_bucket_size": 5e8,
-				"allgather_bucket_size": 5e8,
-				"sub_group_size": 5e8,
-				"round_robin_gradients": True,
-				"offload_optimizer": {
-					"device": "cpu",
-					"pin_memory": True
-				},
-				"offload_param": {
-					"device": "cpu",
-					"pin_memory": True
-				},
-				"zero_quantized_weights": self.use_compression_training,
-				"zero_hpz_partition_size": world_size(),
-				"zero_quantized_gradients": self.use_compression_training,
+				#"reduce_bucket_size": 5e8,
+				#"allgather_bucket_size": 5e8,
+				#"sub_group_size": 5e8,
+				#"zero_quantized_weights": self.use_compression_training,
+				#"zero_hpz_partition_size": world_size(),
+				#"zero_quantized_gradients": self.use_compression_training,
 			} if self.zero_optimization_level > 0 else None,
 			"comms_logger": {
 				"enabled": False
+			},
+			"flops_profiler": {
+				"enabled": self.profile,
+				"profile_step": 1,
+				"module_depth": -1,
+				"top_modules": 1,
+				"detailed": True,
+				"output_file": profiler_path
 			}
 		}
 
@@ -676,10 +777,9 @@ class DeepSpeed:
 		for k in null_keys:
 			del ds_cfg[k]
 
-		if os.path.exists("./data/ds_config.json"):
-			ds_cfg.update(json.loads(open("./data/ds_config.json", "r", encoding="utf-8")).read())
-		else:
-			ds_cfg.update(self.config)
+		ds_cfg.update(self.config)
+		if ds_cfg_path.exists():
+			ds_cfg.update( json_read( ds_cfg_path ) )
 
 		return ds_cfg
 
@@ -709,13 +809,17 @@ class Trainer:
 
 	activation_checkpointing: bool | None = None # deprecated, should technically be used for only on activations and not the entire gradients, but HF only has gradient checkpointing
 	gradient_checkpointing: bool = True # enables gradient checkpointing to save VRAM at the cost of slightly reduced performance when training
+	detect_grad_anomaly: bool = False # torch.autograd.set_detect_anomaly
 
 	check_for_oom: bool = True # checks for OOMs thrown during forward/backwards
 	gc_mode: str | None = None # deprecated, but marks when to do GC
 
 	wandb: bool = False # use wandb, if available
+	wandb_params: dict = field(default_factory=lambda: dict)
 
 	weight_dtype: str = "float16" # dtype to have the model under
+	audio_device: str = "auto"
+	decode_non_resp_audio: bool = True
 
 	amp: bool = False # automatic mixed precision
 	ddp: bool = False # torch's internal DDP, automatically set if local backend is used and multiple GPUs are requested
@@ -744,6 +848,8 @@ class Inference:
 	normalize: bool = False # to-do: actually normalize input / output audio, I believe this might cause issues though
 
 	batch_size: int = 16 # I don't know what would be a good batch size
+
+	audio_backends: dict = field(default_factory=lambda: {})
 
 	@property
 	def dtype(self):
@@ -803,20 +909,26 @@ class Config(BaseConfig):
 	supported_weights_formats: list[str] = field(default_factory=lambda: ["sft", "safetensors", "pt", "pth"])
 
 	def set_audio_backend(self, audio_backend):
-		cfg.audio_backend = audio_backend
+		self.audio_backend = audio_backend
+
 		audio_extension = None
 		if audio_backend in ["encodec", "vocos"]:
 			audio_extension = ".enc"
-			cfg.sample_rate = 24_000
-			cfg.model.resp_levels = 8
+			self.sample_rate = 24_000
+			#self.model.resp_levels = 8
 		elif audio_backend == "dac":
 			audio_extension = ".dac"
-			cfg.sample_rate = 44_100
-			cfg.model.resp_levels = 9
-		elif cfg.audio_backend == "audiodec":
+			self.sample_rate = 44_100
+			#self.model.resp_levels = 9
+		elif self.audio_backend == "audiodec":
 			audio_extension = ".dec"
-			sample_rate = 48_000
-			cfg.model.resp_levels = 8 # ?
+			self.sample_rate = 48_000
+			#self.model.resp_levels = 8 # ?
+		elif self.audio_backend == "nemo":
+			audio_extension = ".nem"
+			self.sample_rate = 44_100
+			#self.model.resp_levels = 8
+			#self.model.audio_tokens = 1000
 		else:
 			raise Exception(f"Unknown audio backend: {audio_backend}")
 
@@ -829,6 +941,8 @@ class Config(BaseConfig):
 			audio_extension = ".dac"
 		elif self.audio_backend == "audiodec":
 			audio_extension = ".dec"
+		elif self.audio_backend == "nemo":
+			audio_extension = ".nem"
 		return audio_extension
 
 	@property
@@ -986,6 +1100,10 @@ class Config(BaseConfig):
 			if not isinstance( model, dict ):
 				continue
 
+			# was made an inherent property tied to audio_backend
+			if "resp_levels" in model:
+				del model["resp_levels"]
+
 			# to-do: prune unused keys in here too automatically
 			if "experimental" not in model or not model["experimental"]:
 				model["experimental"] = {}
@@ -1022,10 +1140,6 @@ class Config(BaseConfig):
 				model.training = False
 			if model.training:
 				model.teacher = False
-
-		if self.hyperparameters.scheduler_type and not self.hyperparameters.scheduler:
-			self.hyperparameters.scheduler = self.hyperparameters.scheduler_type
-			self.hyperparameters.scheduler_type = ""
 
 		# do not combine the two
 		if self.hyperparameters.scheduler == "schedulefree" and self.optimizations.dadaptation:
@@ -1077,6 +1191,8 @@ class Config(BaseConfig):
 				raise Exception(f'Tokenizer path not found: {text_tokenizer_path}')
 
 			self.text_tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(text_tokenizer_path))
+
+		self.set_audio_backend(self.audio_backend)
 
 
 # Preserves the old behavior

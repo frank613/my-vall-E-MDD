@@ -27,26 +27,27 @@ _logger = logging.getLogger(__name__)
 mel_stft_loss = auraloss.freq.MelSTFTLoss(cfg.sample_rate, device="cpu")
 
 def train_feeder(engine, batch, teacher=None):
-	engine.tokens_processed += sum([ text.shape[0] for text in batch["text"] ])
+	engine.tokens_processed += sum([ text.shape[0] for text in batch["phns"] ])
 	engine.tokens_processed += sum([ resps.shape[0] for resps in batch["resps"] ])
 
 	with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
-		batch_size = len(batch["text"])
+		batch_size = len(batch["phns"])
 		engine.current_batch_size = batch_size
 		##engine __call__ engine.forward()
 		output = engine(
-			text_list=batch["text"],
+			phns_list=batch["phns"],
 			proms_list=batch["proms"],
 			resps_list=batch["resps"],
 			lang_list=batch["lang"],
 			tone_list=batch["tone"],
 			task_list=batch["task"],
-			raw_text_list=batch["raw_text"],
+			text_list=batch["text"],
 
 			training=True,
 		)
 
 		# get soft targets from teacher
+		"""
 		if teacher is not None:
 			# extract inputs forwarded to model
 			inputs = output.inputs
@@ -99,7 +100,8 @@ def train_feeder(engine, batch, teacher=None):
 			for k in engine.module.loss.keys():
 				engine.module.loss[k] *= (1.0 - A)
 			engine.module.loss[L] = torch.stack(soft_losses).sum() * A * (T ** 2) / batch_size
-		## base model has an attritbues self.loss
+		"""
+
 		losses = engine.gather_attribute("loss")
 		stat = engine.gather_attribute("stats")
 
@@ -120,7 +122,7 @@ def run_eval(engines, eval_name, dl, args=None):
 		return
 
 	def process( name, batch, resps_list ):
-		for speaker, path, ref, hyp, prom, task in zip(batch["spkr_name"], batch["path"], batch["resps"], resps_list, batch["proms"], batch["task"]):
+		for speaker, path, ref, hyp, prom, task in zip(batch["speaker_name"], batch["path"], batch["resps"], resps_list, batch["proms"], batch["task"]):
 			if len(hyp) == 0:
 				continue
 
@@ -142,13 +144,14 @@ def run_eval(engines, eval_name, dl, args=None):
 			ref_path.parent.mkdir(parents=True, exist_ok=True)
 			prom_path.parent.mkdir(parents=True, exist_ok=True)
 			
-			hyp_audio, sr = qnt.decode_to_file(hyp, hyp_path)
+			audio_device = cfg.device if cfg.trainer.audio_device == "auto" else cfg.trainer.audio_device
+			hyp_audio, sr = qnt.decode_to_file(hyp, hyp_path, audio_device)
 			
 			if ref is not None:
-				ref_audio, sr = qnt.decode_to_file(ref, ref_path)
+				ref_audio, sr = qnt.decode_to_file(ref, ref_path, audio_device)
 
 			if prom is not None:
-				prom_audio, sr = qnt.decode_to_file(prom, prom_path)
+				prom_audio, sr = qnt.decode_to_file(prom, prom_path, audio_device)
 
 			# naive loss calculation
 			# to-do: find a better way to calculate this / a better metric
@@ -174,8 +177,9 @@ def run_eval(engines, eval_name, dl, args=None):
 		for key in batch.keys():
 			batch[key] = batch[key][:cfg.evaluation.batch_size]
 
-		batch_size = len(batch["text"])
+		batch_size = len(batch["phns"])
 
+		"""
 		# to-do: eval for text tasks
 		has_stt = False
 		for i, task in enumerate( batch["task"] ):
@@ -189,69 +193,73 @@ def run_eval(engines, eval_name, dl, args=None):
 
 		# random prompts requested
 		if args and args.eval_random_text_prompts and eval_name == "subtrain":
-			for i, _ in enumerate(batch["text"]):
-				batch["text"][i] = get_random_prompt(tokenized=True).to(device=cfg.device)
+			for i, _ in enumerate(batch["phns"]):
+				batch["phns"][i] = get_random_prompt(tokenized=True).to(device=cfg.device)
 				batch["resps"][i] = None
+		"""
 
 		processed += batch_size
 		for name in engines:
 			engine = engines[name]
 
 			base_kwargs = dict(
-				text_list=batch["text"],
+				phns_list=batch["phns"],
 				proms_list=batch["proms"],
 				lang_list=batch["lang"],
 				task_list=batch["task"],
 				training=False,
 			)
 
-			if engine.hyper_config.experimental.hf:
-				resps_list = engine( **base_kwargs )
-			elif "len" in engine.hyper_config.capabilities:
-				kwargs = base_kwargs | cfg.evaluation.kwargs
-				max_steps = kwargs.pop("max_steps", 500)
-
-				if "denoise_start" in kwargs:
-					len_list = [ resp.shape[0] for resp in batch["resps"] ]
-					kwargs["resps_list"] = [ resp[:, :1] for resp in batch["resps"] ]
-				else:
-					len_list = engine( max_steps=5, **kwargs )
-					len_list = [ min( l, max_steps ) for l in len_list ]
-				
-				kwargs = base_kwargs | cfg.evaluation.kwargs
-				resps_list = engine( **kwargs, len_list=len_list )
-			else:
-				if "ar" in engine.hyper_config.capabilities:
+			with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
+				if engine.hyper_config.version >= 7:
 					kwargs = base_kwargs | cfg.evaluation.kwargs
+					# sample for NAR demask
+					if random.random() < engine.hyper_config.experimental.masking_train_p:
+						kwargs["len_list"] = [ resp.shape[0] for resp in batch["resps"] ]
+					# inference
 					resps_list = engine( **kwargs )
 				else:
-					resps_list = [ resp[:, 0] for resp in batch["resps"] ]
+					if "len" in engine.hyper_config.capabilities:
+						kwargs = base_kwargs | cfg.evaluation.kwargs
+						max_steps = kwargs.pop("max_steps", 500)
 
-				if "nar" in engine.hyper_config.capabilities:
-					kwargs = base_kwargs | cfg.evaluation.kwargs
-					resps_list = engine( **kwargs, resps_list=resps_list )
+						if "denoise_start" in kwargs:
+							len_list = [ resp.shape[0] for resp in batch["resps"] ]
+							kwargs["resps_list"] = [ resp[:, :1] for resp in batch["resps"] ]
+						else:
+							len_list = engine( max_steps=5, **kwargs )
+							len_list = [ min( l, max_steps ) for l in len_list ]
+						
+						kwargs = base_kwargs | cfg.evaluation.kwargs
+						resps_list = engine( **kwargs, len_list=len_list )
+					else:
+						if "ar" in engine.hyper_config.capabilities:
+							kwargs = base_kwargs | cfg.evaluation.kwargs
+							resps_list = engine( **kwargs )
+						else:
+							resps_list = [ resp[:, 0] for resp in batch["resps"] ]
+
+						if "nar" in engine.hyper_config.capabilities:
+							kwargs = base_kwargs | cfg.evaluation.kwargs
+							resps_list = engine( **kwargs, resps_list=resps_list )
 
 			process( name, batch, resps_list )
 
-			# evaluate why it's so slow
-			if has_stt:
-				max_steps = max( [ text.shape[0] for text in batch["text"] ] )
-
-				kwargs["text_list"] = None
-				kwargs["task_list"] = [ "stt" for _ in range(batch_size) ]
-				kwargs["proms_list"] = [ ["stt"] for _ in range(batch_size) ]
-				kwargs["resps_list"] = batch["resps"]
-
-				text_list = engine( **kwargs, max_steps=max_steps, sampling_temperature=0.0)
-				text_list = [ cfg.tokenizer.decode( text ) for i, text in enumerate( text_list ) ]
-
-				_logger.info(f"Validation Metrics (STT): {text_list}")
-
 	stats = {k: sum(v) / len(v) for k, v in stats.items() if v}
 	engines_stats = {
-		f'{name}.{eval_name}': stats,
+		eval_name: stats,
 		"it": engines.global_step,
 	}
+
+	try:
+		for name, engine in engines.items():
+			if engine.wandb is not None:
+				engine.wandb.log({
+					f'{eval_name}.loss.mstft': stats['loss'],
+				}, step=engine.global_step)
+	except Exception as e:
+		print(e)
+
 	#engines_stats['epoch'] = iteration * cfg.hyperparameters.gradient_accumulation_steps / len(dl)
 
 	_logger.info(f"Validation Metrics: {json.dumps(engines_stats)}.")

@@ -20,16 +20,19 @@ from ..config import cfg
 
 # need to validate if this is safe to import before modifying the config
 from .g2p import encode as phonemize
-from .qnt import encode as quantize
+from .qnt import encode as quantize, encode_batch as quantize_batch
+from ..data import _load_artifact
 
 def pad(num, zeroes):
 	return str(num).zfill(zeroes+1)
 
-def load_audio( path, device=None ):
+def load_audio( path, device=None, dtype=None ):
 	waveform, sr = torchaudio.load( path )
 	if waveform.shape[0] > 1:
 		# mix channels
 		waveform = torch.mean(waveform, dim=0, keepdim=True)
+	if dtype is not None:
+		waveform = waveform.to(dtype)
 	if device is not None:
 		waveform = waveform.to(device)
 	return waveform, sr
@@ -38,9 +41,13 @@ def process_items( items, stride=0, stride_offset=0 ):
 	items = sorted( items )
 	return items if stride == 0 else [ item for i, item in enumerate( items ) if (i+stride_offset) % stride == 0 ]
 
-def process_job( outpath, waveform, sample_rate, text=None, language="en", device="cuda" ):
+def process_job( outpath, waveform, sample_rate, text=None, language="en", device="cuda", dtype=None ):
 	# encodec requires this to be on CPU for resampling
-	qnt = quantize(waveform, sr=sample_rate, device=device)
+	qnt = quantize(waveform, sr=sample_rate, device=device, dtype=dtype)
+
+	if torch.count_nonzero(qnt) == 0:
+		tqdm.write(f"Quantization returned zero'd tensor: {outpath}")
+		return
 
 	if cfg.audio_backend == "dac":
 		state_dict = {
@@ -75,14 +82,84 @@ def process_job( outpath, waveform, sample_rate, text=None, language="en", devic
 	
 	np.save(open(outpath, "wb"), state_dict)
 
-def process_jobs( jobs, speaker_id="", device=None, raise_exceptions=True ):
+def process_batched_jobs( jobs, speaker_id="", device=None, raise_exceptions=True, batch_size=1, dtype=None ):
 	if not jobs:
 		return
+
+	# sort to avoid egregious padding
+	jobs = sorted(jobs, key=lambda x: x[1].shape[-1], reverse=True)
+
+	batches = []
+	while jobs:
+		batches.append(jobs[:batch_size])
+		jobs = jobs[batch_size:]
+
+	for batch in tqdm(batches, desc=f'Quantizing {speaker_id} (batch size: {batch_size})'):
+		wavs = []
+		srs = []
+		
+		for outpath, waveform, sample_rate, text, language in batch:
+			wavs.append(waveform)
+			srs.append(sample_rate)
+		
+		try:
+			codes = quantize_batch(wavs, sr=srs, device=device, dtype=dtype)
+		except Exception as e:
+			_logger.error(f"Failed to quantize: {outpath}: {str(e)}")
+			if raise_exceptions:
+				raise e
+			continue
+
+		for (outpath, waveform, sample_rate, text, language), qnt in zip( batch, codes ):
+			if torch.count_nonzero(qnt) == 0:
+				tqdm.write(f"Quantization returned zero'd tensor: {outpath}")
+				continue
+
+			if cfg.audio_backend == "dac":
+				state_dict = {
+					"codes": qnt.codes.cpu().numpy().astype(np.uint16),
+					"metadata": {
+						"original_length": qnt.original_length,
+						"sample_rate": qnt.sample_rate,
+						
+						"input_db": qnt.input_db.cpu().numpy().astype(np.float32),
+						"chunk_length": qnt.chunk_length,
+						"channels": qnt.channels,
+						"padding": qnt.padding,
+						"dac_version": "1.0.0",
+					},
+				}
+			else:						
+				state_dict = {
+					"codes": qnt.cpu().numpy().astype(np.uint16),
+					"metadata": {
+						"original_length": waveform.shape[-1],
+						"sample_rate": sample_rate,
+					},
+				}
+
+			if text:
+				text = text.strip()
+				state_dict['metadata'] |= {
+					"text": text,
+					"phonemes": phonemize(text, language=language),
+					"language": language,
+				}
+			
+			np.save(open(outpath, "wb"), state_dict)
+
+def process_jobs( jobs, speaker_id="", device=None, raise_exceptions=True, batch_size=1, dtype=None ):
+	if not jobs:
+		return
+
+	# batch things
+	if batch_size > 1:
+		return process_batched_jobs( jobs, speaker_id=speaker_id, device=device, raise_exceptions=raise_exceptions, batch_size=batch_size, dtype=dtype )
 	
 	for job in tqdm(jobs, desc=f"Quantizing: {speaker_id}"):
 		outpath, waveform, sample_rate, text, language = job
 		try:
-			process_job( outpath, waveform, sample_rate, text, language, device )
+			process_job( outpath, waveform, sample_rate, text, language, device, dtype=dtype )
 		except Exception as e:
 			_logger.error(f"Failed to quantize: {outpath}: {str(e)}")
 			if raise_exceptions:
@@ -95,12 +172,19 @@ def process(
 	input_voice=None,
 	input_metadata="metadata",
 	output_dataset="training",
+	transcription_filename="whisper.json",
 	raise_exceptions=False,
+	verify_audio=False,
 	stride=0,
 	stride_offset=0,
 	slice="auto",
-
+	batch_size=1,
+	max_duration=None,
+	min_utterances=None,
+	skip_existing_folders=False,
 	low_memory=False,
+	batch_threshold=0,
+	strict_languages=False,
 
 	device="cuda",
 	dtype="float16",
@@ -113,6 +197,8 @@ def process(
 
 	cfg.inference.weight_dtype = dtype # "bfloat16"
 	cfg.inference.amp = amp # False
+
+	dtype = cfg.inference.dtype if not amp else None
 
 	output_dataset = f"{output_dataset}/{'2' if cfg.sample_rate == 24_000 else '4'}{'8' if cfg.sample_rate == 48_000 else '4'}KHz-{cfg.audio_backend}" # "training"
 
@@ -133,6 +219,15 @@ def process(
 		"audio": []
 	}
 	dataset = []
+	jobs = []
+	waveforms = {}
+
+	def check_and_process_jobs(jobs, speaker_id=""):
+		if len(jobs) < batch_threshold:
+			return False
+		
+		process_jobs( jobs, device=device, speaker_id=speaker_id, raise_exceptions=raise_exceptions, batch_size=batch_size, dtype=dtype if not amp else None )
+		return True
 
 	if input_voice is not None:
 		only_speakers = [input_voice]
@@ -156,43 +251,53 @@ def process(
 				continue
 			if only_speakers and speaker_id not in only_speakers:
 				continue
+			
+			outfolder = Path(f'./{output_dataset}/{group_name}/{speaker_id}/')
 
-			os.makedirs(f'./{output_dataset}/{group_name}/{speaker_id}/', exist_ok=True)
+			if skip_existing_folders and outfolder.exists():
+				continue
+			
+			outfolder.mkdir(parents=True, exist_ok=True)
 
 			if speaker_id in audio_only:
-				for filename in sorted(os.listdir(f'./{input_audio}/{group_name}/{speaker_id}/')):
+				for filename in tqdm(sorted(os.listdir(f'./{input_audio}/{group_name}/{speaker_id}/')), desc=f"Processing {speaker_id}"):
 					inpath = Path(f'./{input_audio}/{group_name}/{speaker_id}/{filename}')
 					outpath = Path(f'./{output_dataset}/{group_name}/{speaker_id}/{filename}').with_suffix(audio_extension)
 
 					if outpath.exists():
 						continue
 
-					waveform, sample_rate = load_audio( inpath )
-					qnt = quantize(waveform, sr=sample_rate, device=device)
-
-					process_job(outpath, waveform, sample_rate)
+					waveform, sample_rate = load_audio( inpath, dtype=dtype )
+					try:
+						process_job( outpath, waveform, sample_rate, None, language="en", device=device, dtype=dtype if not amp else None)
+					except Exception as e:
+						_logger.error(f"Failed to quantize: {outpath}: {str(e)}")
+						if raise_exceptions:
+							raise e
+						continue
 
 				continue
 			
-			metadata_path = Path(f'./{input_metadata}/{group_name}/{speaker_id}/whisper.json')
+			metadata_path = Path(f'./{input_metadata}/{group_name}/{speaker_id}/{transcription_filename}')
 			if not metadata_path.exists():
 				missing["transcription"].append(str(metadata_path))
-				_logger.warning(f'Missing transcription metadata: ./{input_audio}/{group_name}/{speaker_id}/whisper.json')
+				_logger.warning(f'Missing transcription metadata: ./{input_audio}/{group_name}/{speaker_id}/{transcription_filename}')
 				continue
 
 			try:
 				metadata = json.loads(open(metadata_path, "r", encoding="utf-8").read())
 			except Exception as e:
 				missing["transcription"].append(str(metadata_path))
-				_logger.warning(f'Failed to open transcription metadata: ./{input_audio}/{group_name}/{speaker_id}/whisper.json: {e}')
+				_logger.warning(f'Failed to open transcription metadata: ./{input_audio}/{group_name}/{speaker_id}/{transcription_filename}: {e}')
 				continue
 
 			if f'{group_name}/{speaker_id}' not in dataset:
 				dataset.append(f'{group_name}/{speaker_id}')
 
-			jobs = []
 
 			use_slices = slice == True or (slice == "auto" and len(metadata.keys()) == 1) or group_name in always_slice_groups
+			if min_utterances and len(metadata.keys()) < min_utterances:
+				continue
 
 			for filename in sorted(metadata.keys()):
 				inpath = Path(f'./{input_audio}/{group_name}/{speaker_id}/{filename}')
@@ -212,6 +317,22 @@ def process(
 				if not language:
 					language = "en"
 
+				if language == "english":
+					language = "en"
+				elif language == "japanese":
+					language = "ja"
+				elif language == "french":
+					language = "fr"
+				elif language == "german":
+					language = "de"
+				elif language == "korean":
+					language = "ko"
+				elif language == "chinese":
+					language = "zh"
+
+				if strict_languages and language not in ["en", "ja", "fr", "de", "ko", "zh"]:
+					language = "auto"
+
 				if len(metadata[filename]["segments"]) == 0 or not use_slices:
 					outpath = Path(f'./{output_dataset}/{group_name}/{speaker_id}/{fname}.{extension}').with_suffix(audio_extension)
 					text = metadata[filename]["text"]
@@ -219,15 +340,17 @@ def process(
 					if len(text) == 0 or outpath.exists():
 						continue
 
-					# audio not already loaded, load it
-					if waveform is None:
-						waveform, sample_rate = load_audio( inpath )
+					if max_duration:
+						info = torchaudio.info( inpath )
+						if info.num_frames / info.sample_rate > max_duration:
+							continue
 
+					waveform, sample_rate = load_audio( inpath, dtype=dtype )
 					jobs.append(( outpath, waveform, sample_rate, text, language ))
 				else:
 					i = 0
 					presliced = not inpath.exists()
-					
+
 					for segment in metadata[filename]["segments"]:
 						id = pad(i, 4)
 						i = i + 1
@@ -243,14 +366,26 @@ def process(
 						text = segment["text"]
 
 						if len(text) == 0 or outpath.exists():
+							if not verify_audio:
+								continue
+
+							artifact = _load_artifact( outpath )
+							if torch.count_nonzero(artifact) > 0:
+								continue
+							tqdm.write(f"Found zero'd quantized audio tensor: {outpath}")
+
+						start = (segment['start']-0.05)
+						end = (segment['end']+0.5)
+						
+						if max_duration and end - start > max_duration:
 							continue
 
 						# audio not already loaded, load it
 						if waveform is None:
-							waveform, sample_rate = load_audio( inpath )
+							waveform, sample_rate = load_audio( inpath, dtype=dtype )
 
-						start = int((segment['start']-0.05) * sample_rate)
-						end = int((segment['end']+0.5) * sample_rate)
+						start = int(start * sample_rate)
+						end = int(end * sample_rate)
 
 						if not presliced:
 							if start < 0:
@@ -263,15 +398,11 @@ def process(
 
 						jobs.append(( outpath, waveform if presliced else waveform[:, start:end], sample_rate, text, language ))
 
-				# processes audio files one at a time
-				if low_memory:
-					process_jobs( jobs, device=device, speaker_id=f'{speaker_id}/{filename}', raise_exceptions=raise_exceptions )
-					jobs = []
-			
-			# processes all audio files for a given speaker
-			if not low_memory:
-				process_jobs( jobs, device=device, speaker_id=speaker_id, raise_exceptions=raise_exceptions )
+			if check_and_process_jobs(jobs, speaker_id=speaker_id):
 				jobs = []
+	
+	batch_threshold = 0
+	check_and_process_jobs(jobs, speaker_id=speaker_id)
 
 	open(f"./{output_dataset}/missing.json", 'w', encoding='utf-8').write(json.dumps(missing))
 	open(f"./{output_dataset}/dataset.json", 'w', encoding='utf-8').write(json.dumps(dataset))
@@ -284,11 +415,19 @@ def main():
 	parser.add_argument("--input-voice", type=str, default=None)
 	parser.add_argument("--input-metadata", type=str, default="training/metadata")
 	parser.add_argument("--output-dataset", type=str, default="training/dataset")
+	parser.add_argument("--transcription-filename", type=str, default="whisper.json")
 	parser.add_argument("--raise-exceptions", action="store_true")
-	parser.add_argument("--low-memory", action="store_true")
+	parser.add_argument("--verify-audio", action="store_true")
+	#parser.add_argument("--low-memory", action="store_true")
+	parser.add_argument("--skip-existing-folders", action="store_true")
+	parser.add_argument("--strict-languages", action="store_true")
 	parser.add_argument("--stride", type=int, default=0)
 	parser.add_argument("--stride-offset", type=int, default=0)
 	parser.add_argument("--slice", type=str, default="auto")
+	parser.add_argument("--batch-size", type=int, default=0)
+	parser.add_argument("--max-duration", type=int, default=0)
+	parser.add_argument("--min-utterances", type=int, default=0)
+	parser.add_argument("--batch-threshold", type=int, default=0)
 	
 	parser.add_argument("--device", type=str, default="cuda")
 	parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -314,12 +453,20 @@ def main():
 		input_voice=args.input_voice,
 		input_metadata=args.input_metadata,
 		output_dataset=args.output_dataset,
+		transcription_filename=args.transcription_filename,
 		raise_exceptions=args.raise_exceptions,
+		verify_audio=args.verify_audio,
 		stride=args.stride,
 		stride_offset=args.stride_offset,
 		slice=args.slice,
+		batch_size=args.batch_size,
+		max_duration=args.max_duration,
+		min_utterances=args.min_utterances,
+		batch_threshold=args.batch_threshold,
+		skip_existing_folders=args.skip_existing_folders,
+		strict_languages=args.strict_languages,
 		
-		low_memory=args.low_memory,
+		#low_memory=args.low_memory,
 
 		device=args.device,
 		dtype=args.dtype,

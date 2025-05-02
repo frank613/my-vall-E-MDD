@@ -37,6 +37,7 @@ import time
 import torch
 import torch.distributed
 import os
+import re
 
 from torch import Tensor
 from torch.distributed import all_reduce
@@ -44,7 +45,7 @@ from typing import Any, Protocol
 from functools import cached_property
 
 from .base import TrainFeeder
-from ..utils import wrapper as ml
+from ..utils import ml
 
 _logger = logging.getLogger(__name__)
 
@@ -63,21 +64,20 @@ class Engine():
 			kwargs.pop("hyper_config")
 
 		self.module = kwargs['model'].to(cfg.device).to(torch.float32 if cfg.trainer.amp else cfg.trainer.dtype)
-		self.optimizer = kwargs['optimizer'] if 'optimizer' in kwargs else None
-		self.lr_scheduler = kwargs['lr_scheduler'] if 'lr_scheduler' in kwargs else None
-
-		stats = kwargs.pop("stats", {})
-		if stats is None:
-			stats = {}
-		self.global_steps = stats.pop("global_step", 0)
-		self.micro_steps = stats.pop("micro_step", 0)
-		self.global_samples = stats.pop("global_samples", 0)
-		self.tokens_processed = stats.pop("tokens_processed", 0)
-
-		self._frozen_params = set()
-
+		self.optimizer = kwargs.get('optimizer', None)
+		self.lr_scheduler = kwargs.get('lr_scheduler', None)
 		self.loss_scaler = torch.cuda.amp.GradScaler() if cfg.trainer.scale_loss else None
 
+		stats = kwargs.get("stats", {})
+		if stats is None:
+			stats = {}
+		
+		self.global_steps = stats.get("global_step", 0)
+		self.micro_steps = stats.get("micro_step", 0)
+		self.global_samples = stats.get("global_samples", 0)
+		self.tokens_processed = stats.get("tokens_processed", 0)
+
+		self._frozen_params = set()
 		self.current_batch_size = 0
 		self._global_grad_norm = None
 
@@ -247,7 +247,7 @@ class Engine():
 			self.global_samples += self.batch_size
 
 			if (self.micro_steps + 1) % max(1, self.gradient_accumulation_steps) == 0:
-				torch.nn.utils.clip_grad_norm_(self.module.parameters(), self.gradient_clipping)
+				self._global_grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), self.gradient_clipping)
 
 				self.global_steps += 1 
 				if self.loss_scaler is not None:
@@ -255,10 +255,13 @@ class Engine():
 					self.loss_scaler.update()
 				else:
 					self.optimizer.step()
+				
+				if self.lr_scheduler is not None:
+					self.lr_scheduler.step()
+				
 				self.optimizer.zero_grad()
-
-				self._get_grad_norm()
 	
+	# doesn't actually work
 	def _get_grad_norm(self):
 		t = [ param.grad.detach().flatten() for param in self.module.parameters() if param.grad is not None ]
 		self._global_grad_norm = torch.cat(t).norm().item() if len(t) else None
@@ -278,6 +281,20 @@ class Engine():
 				param_group['d_coeff'] = lr
 			elif 'lr' in param_group:
 				param_group['lr'] = lr
+
+	def get_loss_scale(self):
+		if not hasattr(self, "loss_scaler") or self.loss_scaler is None:
+			return 1
+
+		return self.loss_scaler.get_scale()
+
+	def set_loss_scale(self, value):
+		if not hasattr(self, "loss_scaler") or self.loss_scaler is None:
+			return
+		
+		"""
+		self.optimizer.loss_scale = value
+		"""
 
 	def get_global_grad_norm(self):
 		return self._global_grad_norm
@@ -443,7 +460,7 @@ class Engines(dict[str, Engine]):
 				engine.tokens_processed = 0
 
 		# update the LR because for some god awful reason it gets overwritten when loading from a checkpoint but only when it's not using a scheduler
-		if cfg.hyperparameters.scheduler_type == "":
+		if cfg.hyperparameters.scheduler == "":
 			self.set_lr(cfg.hyperparameters.learning_rate)
 
 		self._update()
@@ -453,6 +470,12 @@ class Engines(dict[str, Engine]):
 			if not engine._training:
 				continue
 			engine.set_lr(lr)
+
+	def set_loss_scale(self, lr):
+		for engine in self.values():
+			if not engine._training:
+				continue
+			engine.set_loss_scale(lr)
 
 	def _update(self):
 		for engine in self.values():
@@ -581,11 +604,14 @@ class Engines(dict[str, Engine]):
 			elapsed_time = time.time() - start_time
 			total_elapsed_time += elapsed_time
 			grad_norm = engine.get_global_grad_norm()
-			loss_scale = 1
-			if hasattr(engine.optimizer, "loss_scale") and engine.optimizer.loss_scale is not None:
-				loss_scale = engine.optimizer.loss_scale
-			
-			if grad_norm is not None:
+			loss_scale = engine.get_loss_scale()
+
+			if cfg.trainer.deepspeed.max_loss_scale > 0 and loss_scale > cfg.trainer.deepspeed.max_loss_scale:
+				_logger.warning(f'Loss scale ({loss_scale}) exceeds max_loss_scale ({cfg.trainer.deepspeed.max_loss_scale}), capping...')
+				engine.set_loss_scale(cfg.trainer.deepspeed.max_loss_scale)
+
+			# scale the grad norm to normal, if not using ZeRO because ZeRO does this already
+			if grad_norm is not None and not cfg.trainer.deepspeed.zero_optimization_level:
 				grad_norm /= loss_scale
 
 			model_stats = dict(
@@ -596,6 +622,22 @@ class Engines(dict[str, Engine]):
 		
 			if engine.wandb is not None:
 				engine.wandb.log(model_stats, step=engine.global_step)
+
+			filtered_keys = [ k for k in model_stats.keys() if "[" in k ]
+			filtered_values = {}
+			for k in filtered_keys:
+				v = model_stats[k]
+				del model_stats[k]
+
+				nk = re.sub(r"\[\d+\]", "", k)
+				
+				if nk not in filtered_values:
+					filtered_values[nk] = []
+				
+				filtered_values[nk].append( v )
+
+			for k, v in filtered_values.items():
+				model_stats[k] = sum(v) / len(v)
 
 			model_stats = model_stats | dict(
 				lr=engine.get_lr()[0],
@@ -609,7 +651,10 @@ class Engines(dict[str, Engine]):
 			if cfg.lora is not None:			
 				key_name = cfg.lora.full_name
 
-			stats.update(flatten_dict({key_name.split("-")[0]: model_stats}))
+			if len(self) == 1:
+				stats.update(flatten_dict(model_stats))
+			else:
+				stats.update(flatten_dict({key_name.split("-")[0]: model_stats}))
 
 		self._update()
 

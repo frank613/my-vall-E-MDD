@@ -16,5 +16,7 @@ from .utils import (
     clamp,
     md5_hash,
     convert_kwargs,
-    coerce_dtype
+    coerce_dtype,
+    mean,
+    logit_normalization,
 )

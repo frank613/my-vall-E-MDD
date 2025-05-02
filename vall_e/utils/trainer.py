@@ -33,7 +33,7 @@ from .distributed import (
 from ..engines import Engine, Engines, TrainFeeder, default_feeder, load_engines
 
 from .utils import to_device, do_gc, truncate_json
-from ..utils import wrapper as ml
+from ..utils import ml
 from ..data import get_phone_symmap # should decouple from this trainer script
 
 _logger = logging.getLogger(__name__)
@@ -109,9 +109,15 @@ def _make_infinite_epochs(dl):
 		if dl.dataset.index() == 0:
 			_logger.info("New epoch starts.")
 		
+		with tqdm(dl, "Epoch progress", dynamic_ncols=True, disable=not is_global_leader()) as pbar:
+			yield from pbar
+
+		"""
+		# this breaks the bar on a new epoch...
 		total = dl.dataset.batches() - dl.dataset.index()
 		with tqdm(dl, "Epoch progress", dynamic_ncols=True, disable=not is_global_leader(), total=total) as pbar:
 			yield from pbar
+		"""
 
 @local_leader_only(default=None)
 def logger(data):
@@ -174,7 +180,9 @@ def train(
 			break
 
 		#batch = to_device(batch, torch.cuda.current_device())
-		stats = engines.step(batch=batch, feeder=train_feeder)
+		with torch.autograd.set_detect_anomaly(cfg.trainer.detect_grad_anomaly):
+			stats = engines.step(batch=batch, feeder=train_feeder)
+
 		stats['epoch'] = engines.global_samples / (len(train_dl.dataset.paths) * world_size())
 
 		elapsed_time = stats.get("elapsed_time", 0)
@@ -225,7 +233,16 @@ def train(
 					engines.set_lr(rate)
 					_logger.info(f"Updating LR to: {rate}")
 				except Exception as e:
-					_logger.warning(f"Failed to set LR rate to: {rate}, {str(e)}")
+					_logger.warning(f"Failed to set LR to: {rate}, {str(e)}")
+
+			if "loss_scale" in command:
+				value = float(command.split(" ")[-1])
+				try:
+					engines.set_loss_scale(value)
+					_logger.info(f"Updating loss scale to: {value}")
+				except Exception as e:
+					raise e
+					_logger.warning(f"Failed to set loss scale to: {value}, {str(e)}")
 
 			if "export" in command:
 				train_dl.dataset.save_state_dict()

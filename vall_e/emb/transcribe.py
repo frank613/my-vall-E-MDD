@@ -19,13 +19,19 @@ except Exception as e:
 	pass
 """
 
-from transformers import pipeline
+try:
+	from transformers import pipeline
+except Exception as e:
+	def _kludge_cringe():
+		raise e
+	pipeline = _kludge_cringe
 
 from functools import cache
 from tqdm.auto import tqdm
 from pathlib import Path
 
-from vall_e.utils import coerce_dtype
+from ..utils import coerce_dtype
+from ..utils.io import json_read, json_write
 
 def pad(num, zeroes):
 	return str(num).zfill(zeroes+1)
@@ -172,11 +178,17 @@ def transcribe(
 	start = 0
 	end = 0
 	segments = []
-	for segment in result["chunks"]:
+
+	info = torchaudio.info(audio)
+	duration = info.num_frames / info.sample_rate
+
+	for segment in result["chunks"]:		
 		text = segment["text"]
 		
 		if "timestamp" in segment:
 			s, e = segment["timestamp"]
+			if not e:
+				e = duration
 			start = min( start, s )
    			#end = max( end, e )
 			#hot bug fixing
@@ -302,7 +314,7 @@ def transcribe_batch(
 		if only_groups and dataset_name not in only_groups:
 			continue
 
-		for speaker_id in tqdm(process_items(os.listdir(f'./{input_audio}/{dataset_name}/')), desc="Processing speaker"):
+		for speaker_id in tqdm(process_items(os.listdir(f'./{input_audio}/{dataset_name}/'), stride=stride, stride_offset=stride_offset), desc="Processing speaker"):
 			if not os.path.isdir(f'./{input_audio}/{dataset_name}/{speaker_id}'):
 				continue
 
@@ -314,7 +326,7 @@ def transcribe_batch(
 			outpath = Path(f'./{output_metadata}/{dataset_name}/{speaker_id}/whisper.json')
 
 			if outpath.exists():
-				metadata = json.loads(open(outpath, 'r', encoding='utf-8').read())
+				metadata = json_read( outpath )
 			else:
 				os.makedirs(f'./{output_metadata}/{dataset_name}/{speaker_id}/', exist_ok=True)
 				metadata = {}
@@ -333,7 +345,7 @@ def transcribe_batch(
 
 				metadata[filename] = transcribe( inpath, model_name=model_name, diarize=diarize, device=device, dtype=dtype )
 
-				open(outpath, 'w', encoding='utf-8').write(json.dumps(metadata))
+				json_write( metadata, outpath )
 
 def main():
 	parser = argparse.ArgumentParser()

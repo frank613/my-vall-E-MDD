@@ -57,23 +57,30 @@ For audio backends:
   - encoding audio will use the `encodec` backend automagically, as there's no EnCodec encoder under `vocos`
 * [`descript-audio-codec`](https://github.com/descriptinc/descript-audio-codec): boasts better compression and quality, but has issues with model convergence.
   - models at 24KHz + 8kbps will NOT converge in any manner.
-  - models at 44KHz + 8kbps seems harder to model its "language", and the NAR side of the model suffers greatly.
+  - models at 44KHz + 8kbps will work for lower codebook levels, but higher codebook levels will ***always*** have issues
+    * this seems to be inherent to the codec itself and not the model, as separate implementations have this problem
+* [`nvidia/audio-codec-44khz`](https://huggingface.co/nvidia/audio-codec-44khz): boasts even better compression and quality
+  - this codec employs FSQ instead of RVQ.
+    * this doesn't seem to have any problems inherent to the codec itself, but instead inherent to FSQ codecs in general
 
 #### Descript-Audio-Codec
 
 Descript-Audio-Codec was thoroughly tested for promising much, much cleaner output audio, as this model encodes/decodes at 44.1KHz, rather than EnCodec's 24KHz.
 
-However, due to the nature of the codec, simply throwing it at an attention-based transformer proves to be painful, as the model *heavily* suffers from noisy output in the higher half of the RVQ levels.
+However, due to the nature of the codec, simply throwing it at an attention-based transformer proves to be painful, as the model *heavily* suffers from noisy output in the higher half of the codebook levels.
+* the solution may be to simply encode / decode with *all* codebook levels in one pass.
 
 Ironically, testing through erroneously encoded audio (feeding 24KHz audio without upsampling to 44.1KHz) proved to have "cleaner" but bad utterances.
 
-I'm uncertain on how to remedy this, as my options are:
-* train under a RetNet, if an attention-based transformer is simply the problem (it's not)
-* train an AR, and train a NAR, if the codec itself is at fault (it's probably something inherent to the codec)
-* use an SSM like Mamba, if transformers entirely cannot model the codec (Mamba is too much of a thorn to use)
-* train a separate model that simply converts from EnCodec to DAC (requires another model to juggle, but does not require training a new model)
-* train *all* NAR levels as independent masking sequences similar to the `NAR-len` (complicated)
-  * if this works, then it means that there's little to no mappable relation between DAC's RVQ levels
+#### `nvidia/audio-codec-44khz`
+
+This novel codec promises more than DAC without the difficulty to model with it.
+
+NVIDIA's NeMo audio codec doesn't necessarily have a concrete name, but is simply referred to as `nemo` in the code. The included code under `./emb/codecs/nemo.py` is mostly copied (with attribution) from the reference implementation with additional tweaks. In the future, it would be beneficial to decouple it from NeMo's framework and its dependencies.
+
+However, because this codec relies on FSQ (Finite Scalar Quantization) rather than RVQ (Residual Vector Quantization), each level of the codebook governs a specific band of the mel spectrum, instead of each level for RVQ governs additive levels to the final audio. Because of this, the original approach of inferencing the strongest detail, then each level predicts the weaker, next detail, is theoretically not a good fit for FSQ-based codecs.
+
+The current approach is to, instead, encode / decode all FSQ levels within each pass. This approach seems promising, as it does not seem to exhibit the problem `descript-audio-codec` did where higher levels fail to train sufficiently enough.
 
 ## `transcribe.py`
 
@@ -93,14 +100,17 @@ This process can utilize sliced segments within the transcription metadata, or u
 
 Refer to the `__main__`'s arguments for usage details.
 
+> [!NOTE]
+> If you're using this to try and split your workload over multiple process / GPUs, it is *imperative* to make sure to keep each process within its own NUMA node by prefixing with `numactl -N0 -m0`, or you'll experience bottlenecks that make processing worse off compared to just doing it with one GPU.
+
 ## `similar.py`
 
 This script handles taking either raw input audio, or processed encoded audio, and determines the top-K similar utterances for each sample for a given speaker (or dataset).
 * For raw input audio, the MFCC (Mel-frequency cepstrum coefficients) are extracted as features from the waveform, and the cosine similarities are compared against every other utterance for a given speaker.
   * This works *fine*, as this is adequately accurate and does not require a model to already exist.
 * For the encoded audio, the audio codes are passed through the model's embedding, summed to one "token", and the cosine similarities are compared to score the top-K similar speakers.
-  * By default, the output response embedding is used, and each RVQ level is summed together to leave one sequence.
-  * In theory this should be better as the model may have its own features per RVQ code+level, but still requires a model to already be trained.
+  * By default, the output response embedding is used, and each codebook level is summed together to leave one sequence.
+  * In theory this should be better as the model may have its own features per codebook + level, but still requires a model to already be trained.
   * The original encoding model's embeddings can also be used, or the last hidden states passed through the model, instead, but seems overkill.
 
 When processing a dataset, this requires already having accompanying metadata generated through `vall_e.data --action=metadata --yaml=./your/training/config.yaml`.

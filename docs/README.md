@@ -27,6 +27,8 @@ This VALL-E is still actively being iterated upon without any actual proper stan
 
 There are far better TTS solutions out there, such as [MaskGCT](https://github.com/open-mmlab/Amphion/tree/main/models/tts/maskgct) and [F5-TTS](https://github.com/SWivid/F5-TTS). They're both easy to use and offer amazing results.
 
+In the future, a 44KHz model will be released if training goes well for it.
+
 ## Model Specifications
 
 The reference model (`ar+nar-llama-8`/`ar+nar-len-llama-8`):
@@ -46,8 +48,10 @@ The reference model (`ar+nar-llama-8`/`ar+nar-len-llama-8`):
 * [x] train and release a serviceable model for finetuning against.
 * [x] train and release a ***good*** zero-shot model.
   - for what it's worth it's decent enough for me to finally be happy with it.
+* [ ] train a serviceable model for 44KHz audio (instead of 24KHz)
 * [ ] well-integrated training through the Web UI (without the kludge from ai-voice-cloning)
 * [x] clean up the README, and document, document, document.
+  * [ ] cleanup the documentation again, as most of it feels like schizorambling......
 * [x] extend to multiple languages ([VALL-E X](https://arxiv.org/abs/2303.03926)).
   - reference model is trained against English, Japanese, French, German, Korean, and Chinese (Mandarin?).
   - [x] improve multi-lingual support
@@ -64,23 +68,29 @@ The reference model (`ar+nar-llama-8`/`ar+nar-len-llama-8`):
 * [ ] speed up inferencing for the AR
   - KV caching both yields broken output and quadratically slow output, unless I'm doing something grossly wrong.
   * [x] provide a pure NAR model that foregoes most of the inferencing slowdowns a regular AR+NAR model will provide.
-* [ ] HF-ify the model
+* [x] HF-ify the model
   * [x] write a weights converter
-  * [ ] implement a pure llama_HF implementation
-  - this might be easily possible by subjugating the tokenizer to handle all the embeddings / classifiers
-  - this will pave the way to use the model under an easy marriage of `llama.cpp` and `encodec.cpp`
+  * [x] implement a pure llama_HF implementation
+    * provided under `./vall_e/models/base.py`'s `__main__`
 * [ ] replace the phonemizer with something that doesn't depend on espeak
   * [ ] train the model to handle text => phoneme (without a hit to the rest of the model)
     * [ ] ...and phonemes => text
     * [ ] using a pure text vocab rather than IPA phonemes (as a transformer should be "smart" enough to map text tokens)
+    * these features are predicated on the model being trained for it
 * [ ] smarter/clever inferencing, such as:
+  * [x] inference *all* codebooks in one pass, rather than each level being its own discrete pass.
+      * `cfg.model.version >= 7` models will rely on this
+      * these features are predicated on the model being trained for it
   * [x] "rolling" context, where the last generated sentence is the prefix for the next sentence.
   * [ ] for the AR, stop inferencing sequences in the batch that has already hit its stop token
 * [x] objective metrics such as WER / SIM-O
   * [x] WER simply requires transcribing audio then computing word error rates through the transcriptions
   * [x] SIM-O requires passing the raw waveform through a speaker-similarity model
-* [ ] valle.cpp through llama.cpp + encodec.cpp
-  * the latter is easy, the former is not.
+* [x] valle.cpp through llama.cpp + encodec.cpp
+  * extend to decode with vocos.cpp, instead, for a quality improvement
+* [ ] 44KHz audio, through either DAC or `nvidia/audio-codec-44khz`
+  * the former has quality issues in the higher RVQ levels, but may be resolved with the experimental implementation
+  * the latter needs testing, as it being an FSQ codec requires extra care
 
 ## "Postmortem"
 
@@ -94,6 +104,15 @@ However, while this solution boasts being lightweight, there are some caveats fo
   * `hf`-ifying it is possible, but due to the nature of summed audio embeddings and split classifiers, it's not as plug-and-play as I would like for inferencing.
 * speaker similarity is rather mediocre for unseen speakers, the model isn't as robust for mapping speakers to its latent space as it is for seen speakers.
 * despite being rather robust, some vocal stutters makes it way in.
+
+### "Postmortem" ""Postmortem""
+
+The model even working at all might entirely be a fluke.
+
+A naive embedding implementation (`./vall_e/models/base.py`) manages to "just work" for EnCodec, while other audio codecs (DAC, `nvidia/audio-codec-44khz`) fail to converge meaningfully.
+
+A more codec-aware embedding/classifier implementation (`./vall_e/models/base_v2.py`) fails to properly learn all levels for any codec, even with all the additional cruft to help things. Even scaling the model up just has the gradients seem a little more chaotic with about the same training progression.
+* However it seems just giving it time will have things eventually sort itself out, maybe.
 
 ## Notices and Citations
 

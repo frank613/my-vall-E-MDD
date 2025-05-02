@@ -19,210 +19,40 @@ from einops import rearrange
 from torch import Tensor
 from tqdm import tqdm
 
+from torch.nn.utils.rnn import pad_sequence
+
+AVAILABLE_AUDIO_BACKENDS = []
+ERRORED_BACKENDS = {}
 try:
-	from encodec import EncodecModel
-	from encodec.utils import convert_audio
+	from .codecs.encodec import *
+	AVAILABLE_AUDIO_BACKENDS.append("encodec")
 except Exception as e:
-	cfg.inference.use_encodec = False
-
-try:
-	from vocos import Vocos
-except Exception as e:
-	cfg.inference.use_vocos = False
-
-
-# try:
-# 	from dac import DACFile
-# 	from audiotools import AudioSignal
-# 	from dac.utils import load_model as __load_dac_model
-
-# 	"""
-# 	Patch decode to skip things related to the metadata (namely the waveform trimming)
-# 	So far it seems the raw waveform can just be returned without any post-processing
-# 	A smart implementation would just reuse the values from the input prompt
-# 	"""
-# 	from dac.model.base import CodecMixin
-
-# 	@torch.no_grad()
-# 	def CodecMixin_compress(
-# 		self,
-# 		audio_path_or_signal: Union[str, Path, AudioSignal],
-# 		win_duration: float = 1.0,
-# 		verbose: bool = False,
-# 		normalize_db: float = -16,
-# 		n_quantizers: int = None,
-# 	) -> DACFile:
-# 		"""Processes an audio signal from a file or AudioSignal object into
-# 		discrete codes. This function processes the signal in short windows,
-# 		using constant GPU memory.
-
-# 		Parameters
-# 		----------
-# 		audio_path_or_signal : Union[str, Path, AudioSignal]
-# 			audio signal to reconstruct
-# 		win_duration : float, optional
-# 			window duration in seconds, by default 5.0
-# 		verbose : bool, optional
-# 			by default False
-# 		normalize_db : float, optional
-# 			normalize db, by default -16
-
-# 		Returns
-# 		-------
-# 		DACFile
-# 			Object containing compressed codes and metadata
-# 			required for decompression
-# 		"""
-# 		audio_signal = audio_path_or_signal
-# 		if isinstance(audio_signal, (str, Path)):
-# 			audio_signal = AudioSignal.load_from_file_with_ffmpeg(str(audio_signal))
-
-# 		self.eval()
-# 		original_padding = self.padding
-# 		original_device = audio_signal.device
-
-# 		audio_signal = audio_signal.clone()
-# 		original_sr = audio_signal.sample_rate
-
-# 		resample_fn = audio_signal.resample
-# 		loudness_fn = audio_signal.loudness
-
-# 		# If audio is > 10 minutes long, use the ffmpeg versions
-# 		if audio_signal.signal_duration >= 10 * 60 * 60:
-# 			resample_fn = audio_signal.ffmpeg_resample
-# 			loudness_fn = audio_signal.ffmpeg_loudness
-
-# 		original_length = audio_signal.signal_length
-# 		resample_fn(self.sample_rate)
-# 		input_db = loudness_fn()
-
-# 		if normalize_db is not None:
-# 			audio_signal.normalize(normalize_db)
-# 		audio_signal.ensure_max_of_audio()
-
-# 		nb, nac, nt = audio_signal.audio_data.shape
-# 		audio_signal.audio_data = audio_signal.audio_data.reshape(nb * nac, 1, nt)
-# 		win_duration = (
-# 			audio_signal.signal_duration if win_duration is None else win_duration
-# 		)
-
-# 		if audio_signal.signal_duration <= win_duration:
-# 			# Unchunked compression (used if signal length < win duration)
-# 			self.padding = True
-# 			n_samples = nt
-# 			hop = nt
-# 		else:
-# 			# Chunked inference
-# 			self.padding = False
-# 			# Zero-pad signal on either side by the delay
-# 			audio_signal.zero_pad(self.delay, self.delay)
-# 			n_samples = int(win_duration * self.sample_rate)
-# 			# Round n_samples to nearest hop length multiple
-# 			n_samples = int(math.ceil(n_samples / self.hop_length) * self.hop_length)
-# 			hop = self.get_output_length(n_samples)
-
-# 		codes = []
-# 		range_fn = range if not verbose else tqdm.trange
-
-# 		for i in range_fn(0, nt, hop):
-# 			x = audio_signal[..., i : i + n_samples]
-# 			x = x.zero_pad(0, max(0, n_samples - x.shape[-1]))
-
-# 			audio_data = x.audio_data.to(self.device)
-# 			audio_data = self.preprocess(audio_data, self.sample_rate)
-# 			with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
-# 				_, c, _, _, _ = self.encode(audio_data, n_quantizers)
-# 			codes.append(c.to(original_device))
-# 			chunk_length = c.shape[-1]
-
-# 		codes = torch.cat(codes, dim=-1)
-
-# 		dac_file = DACFile(
-# 			codes=codes,
-# 			chunk_length=chunk_length,
-# 			original_length=original_length,
-# 			input_db=input_db,
-# 			channels=nac,
-# 			sample_rate=original_sr,
-# 			padding=self.padding,
-# 			dac_version="1.0.0",
-# 			#dac_version=SUPPORTED_VERSIONS[-1],
-# 		)
-
-# 		if n_quantizers is not None:
-# 			codes = codes[:, :n_quantizers, :]
-
-# 		self.padding = original_padding
-# 		return dac_file
-
-# 	@torch.no_grad()
-# 	def CodecMixin_decompress(
-# 		self,
-# 		obj: Union[str, Path, DACFile],
-# 		verbose: bool = False,
-# 	) -> AudioSignal:
-# 		self.eval()
-# 		if isinstance(obj, (str, Path)):
-# 			obj = DACFile.load(obj)
-
-# 		original_padding = self.padding
-# 		self.padding = obj.padding
-
-# 		range_fn = range if not verbose else tqdm.trange
-# 		codes = obj.codes
-# 		original_device = codes.device
-# 		chunk_length = obj.chunk_length
-# 		recons = []
-
-# 		for i in range_fn(0, codes.shape[-1], chunk_length):
-# 			c = codes[..., i : i + chunk_length].to(self.device)
-# 			z = self.quantizer.from_codes(c)[0]
-# 			r = self.decode(z)
-# 			recons.append(r.to(original_device))
-
-# 		recons = torch.cat(recons, dim=-1)
-# 		recons = AudioSignal(recons, self.sample_rate)
-
-# 		# to-do, original implementation
-# 		if not hasattr(obj, "dummy") or not obj.dummy:
-# 			resample_fn = recons.resample
-# 			loudness_fn = recons.loudness
-			
-# 			# If audio is > 10 minutes long, use the ffmpeg versions
-# 			if recons.signal_duration >= 10 * 60 * 60:
-# 				resample_fn = recons.ffmpeg_resample
-# 				loudness_fn = recons.ffmpeg_loudness
-
-# 			recons.normalize(obj.input_db)
-# 			resample_fn(obj.sample_rate)
-# 			recons = recons[..., : obj.original_length]
-# 			loudness_fn()
-# 			recons.audio_data = recons.audio_data.reshape(
-# 				-1, obj.channels, obj.original_length
-# 			)
-# 		self.padding = original_padding
-# 		return recons
-
-# 	CodecMixin.compress = CodecMixin_compress
-# 	CodecMixin.decompress = CodecMixin_decompress
-
-# except Exception as e:
-# 	cfg.inference.use_dac = False
-# 	_logger.warning(str(e))
-
-# uses https://github.com/facebookresearch/AudioDec/
-# I have set up a pip-ify'd version with the caveat of having to manually handle downloading the checkpoints with a wget + unzip
-# I was not happy with testing, it sounded rather mediocre.
-"""
-try:
-	from audiodec.utils.audiodec import AudioDec, assign_model as _audiodec_assign_model
-except Exception as e:
-	cfg.inference.use_audiodec = False
 	_logger.warning(str(e))
-"""
+	ERRORED_BACKENDS["encodec"] = e
+
+try:
+	from .codecs.vocos import *
+	AVAILABLE_AUDIO_BACKENDS.append("vocos")
+except Exception as e:
+	_logger.warning(str(e))
+	ERRORED_BACKENDS["vocos"] = e
+
+try:
+	from .codecs.dac import *
+	AVAILABLE_AUDIO_BACKENDS.append("dac")
+except Exception as e:
+	_logger.warning(str(e))
+	ERRORED_BACKENDS["dac"] = e
+
+try:
+	from .codecs.nemo import *
+	AVAILABLE_AUDIO_BACKENDS.append("nemo")
+except Exception as e:
+	_logger.warning(str(e))
+	ERRORED_BACKENDS["nemo"] = e
 
 @cache
-def _load_encodec_model(device="cuda", levels=0):
+def _load_encodec_model(device="cuda", dtype=None, levels=0):
 	assert cfg.sample_rate == 24_000
 
 	if not levels:
@@ -244,17 +74,18 @@ def _load_encodec_model(device="cuda", levels=0):
 	model = model.to(device)
 	model = model.eval()
 
+	if dtype is not None:
+		model = model.to(dtype)
+
 	# extra metadata
 	model.bandwidth_id = bandwidth_id
-	model.sample_rate = cfg.sample_rate
 	model.normalize = cfg.inference.normalize
 	model.backend = "encodec"
-	model.device = device
 
 	return model
 
 @cache
-def _load_vocos_model(device="cuda", levels=0):
+def _load_vocos_model(device="cuda", dtype=None, levels=0):
 	assert cfg.sample_rate == 24_000
 
 	if not levels:
@@ -263,6 +94,9 @@ def _load_vocos_model(device="cuda", levels=0):
 	model = Vocos.from_pretrained("charactr/vocos-encodec-24khz")
 	model = model.to(device)
 	model = model.eval()
+
+	if dtype is not None:
+		model = model.to(dtype)
 
 	# too lazy to un-if ladder this shit
 	bandwidth_id = 2
@@ -275,113 +109,130 @@ def _load_vocos_model(device="cuda", levels=0):
 
 	# extra metadata
 	model.bandwidth_id = torch.tensor([bandwidth_id], device=device)
-	model.sample_rate = cfg.sample_rate
 	model.backend = "vocos"
-	model.device = device
 
 	return model
 
-# @cache
-# def _load_dac_model(device="cuda"):
-# 	kwargs = dict(model_type="44khz",model_bitrate="8kbps",tag="latest")
-# 	# yes there's a better way, something like f'{cfg.sample.rate//1000}hz'		
-# 	if cfg.sample_rate == 44_100:
-# 		kwargs["model_type"] = "44khz"
-# 	elif cfg.sample_rate == 16_000:
-# 		kwargs["model_type"] = "16khz"
-# 	else:
-# 		raise Exception(f'unsupported sample rate: {cfg.sample_rate}')
+@cache
+def _load_dac_model(device="cuda", dtype=None):
+	kwargs = dict(model_type="44khz",model_bitrate="8kbps",tag="latest")
+	# yes there's a better way, something like f'{cfg.sample.rate//1000}hz'		
+	if cfg.sample_rate == 44_100:
+		kwargs["model_type"] = "44khz"
+	elif cfg.sample_rate == 16_000:
+		kwargs["model_type"] = "16khz"
+	else:
+		raise Exception(f'unsupported sample rate: {cfg.sample_rate}')
 
-# 	model = __load_dac_model(**kwargs)
-# 	model = model.to(device)
-# 	model = model.eval()
+	model = load_dac_model(**kwargs)
+	model = model.to(device)
+	model = model.eval()
 
-# 	model.backend = "dac"
-# 	model.model_type = kwargs["model_type"]
-# 	#model.device = device
+	if dtype is not None:
+		model = model.to(dtype)
+
+	model.backend = "dac"
+	model.model_type = kwargs["model_type"]
 
 # 	return model
 
 @cache
-def _load_audiodec_model(device="cuda", model_name=None):
-	# if not model_name:
-	# 	model_name = "libritts_v1" if cfg.sample_rate == 24_000 else "vctk_v1"
-	# sample_rate, encoder_checkpoint, decoder_checkpoint = _audiodec_assign_model(model_name)
+def _load_nemo_model(device="cuda", dtype=None, model_name=None):
+	if not model_name:
+		model_name = "nvidia/audio-codec-44khz"
 
-	# model = AudioDec(tx_device=device , rx_device=device )
-	# model.load_transmitter(encoder_checkpoint)
-	# model.load_receiver(encoder_checkpoint, decoder_checkpoint)
+	model = AudioCodecModel.from_pretrained(model_name)
+	model = model.to(device)
+	model = model.eval()
 
-	# model.backend = "audiodec"
-	# model.sample_rate = sample_rate
-	# model.device = device
+	if dtype is not None:
+		model = model.to(dtype)
+
+	model.backend = "nemo"
 
 	# return model
 	sys.exit("audiodec is not supported in this version")
 
+
 @cache
-def _load_model(device="cuda", backend=None):
+def _load_model(device="cuda", backend=None, dtype=None):
 	if not backend:
 		backend = cfg.audio_backend
 
-	if backend == "audiodec":
-		return _load_audiodec_model(device)
-	if backend == "dac":
-		#return _load_dac_model(device)
-		sys.exit("dac is not supported in this version")
-	if backend == "vocos":
-		return _load_vocos_model(device)
+	if ERRORED_BACKENDS.get(backend, None):
+		raise ERRORED_BACKENDS[backend]
 
-	return _load_encodec_model(device)
+	if cfg.inference.amp:
+		dtype = None
+
+	if backend == "nemo":
+		return _load_nemo_model(device, dtype=dtype)
+	if backend == "audiodec":
+		return _load_audiodec_model(device, dtype=dtype)
+	if backend == "dac":
+		return _load_dac_model(device, dtype=dtype)
+	if backend == "vocos":
+		return _load_vocos_model(device, dtype=dtype)
+
+	return _load_encodec_model(device, dtype=dtype)
 
 def unload_model():
 	_load_model.cache_clear()
 	_load_encodec_model.cache_clear() # because vocos can only decode
 
+# to-do: clean up this mess
 @torch.inference_mode()
-def decode(codes: Tensor, device="cuda", metadata=None, window_duration=None):
+def decode(codes: Tensor, device="cuda", dtype=None, metadata=None, window_duration=None):
+	# dirty hack during model training
+	codes = torch.where( codes >= ( 1000 if cfg.audio_backend == "nemo" else 1024 ), 0, codes )
+
 	# upcast so it won't whine
-	if codes.dtype == torch.int8 or codes.dtype == torch.int16 or codes.dtype == torch.uint8:
+	if codes.dtype in [torch.int8, torch.int16, torch.uint8]:
 		codes = codes.to(torch.int32)
 
 	# expand if we're given a raw 1-RVQ stream
 	if codes.dim() == 1:
 		codes = rearrange(codes, "t -> 1 1 t")
-	# expand to a batch size of one if not passed as a batch
-	# vocos does not do batch decoding, but encodec does, but we don't end up using this anyways *I guess*
-	# to-do, make this logical
-	elif codes.dim() == 2:
-		codes = rearrange(codes, "t q -> 1 q t")
 
+	# expand to a batch size of one if not passed as a batch
+	elif codes.dim() == 2:
+		# if (t, q), transpose to (q, t) instead
+		if codes.shape[0] > codes.shape[1]:
+			codes = codes.t()
+		codes = codes.unsqueeze(0)
+
+	# life is easier if we assume we're using a batch
 	assert codes.dim() == 3, f'Requires shape (b q t) but got {codes.shape}'
 
 	# load the model
-	model = _load_model(device)
+	model = _load_model(device, dtype=dtype)
+	# move to device
+	codes = codes.to( device=device )
 
-	# AudioDec uses a different pathway
-	if model.backend == "audiodec":
-		codes = codes.to( device=device )[0]
-		zq = model.rx_encoder.lookup( codes )
-		wav = model.decoder.decode(zq).squeeze(1)
-		return wav, model.sample_rate
+	# NeMo uses a different pathway
+	if model.backend == "nemo":
+		l = torch.tensor([c.shape[-1] for c in codes], device=device, dtype=torch.int32)
+		wav, _ = model.decode(tokens=codes, tokens_len=l)
+		return wav, cfg.sample_rate
+	
+	assert codes.shape[0] == 1, f'Batch decoding is unsupported for backend: {model.backend}'
 
 	# DAC uses a different pathway
 	if model.backend == "dac":
-		sys.exit("dac is not supported in this version")
-		# dummy = False
-		# if metadata is None:
-		# 	metadata = dict(
-		# 		chunk_length=codes.shape[-1],
-		# 		original_length=0,
-		# 		input_db=-12,
-		# 		channels=1,
-		# 		sample_rate=model.sample_rate,
-		# 		padding=True,
-		# 		dac_version='1.0.0',
-		# 	)
-		# 	dummy = True
-		# elif hasattr( metadata, "__dict__" ):
-		# 	metadata = metadata.__dict__
+		dummy = False
+		if metadata is None:
+			metadata = dict(
+				chunk_length=codes.shape[-1],
+				original_length=0,
+				input_db=-12,
+				channels=1,
+				sample_rate=cfg.sample_rate,
+				padding=True,
+				dac_version='1.0.0',
+			)
+			dummy = True
+		elif hasattr( metadata, "__dict__" ):
+			metadata = metadata.__dict__
 
 		# # generate object with copied metadata
 		# artifact = DACFile(
@@ -399,21 +250,52 @@ def decode(codes: Tensor, device="cuda", metadata=None, window_duration=None):
 		# # to-do: inject the sample rate encoded at, because we can actually decouple		
 		# return CodecMixin_decompress(model, artifact, verbose=False).audio_data[0], artifact.sample_rate
 
-	kwargs = {}
+	# cleaner to separate out from EnCodec's pathway
 	if model.backend == "vocos":
 		x = model.codes_to_features(codes[0])
-		kwargs['bandwidth_id'] = model.bandwidth_id
-	else:  
-		# encodec will decode as a batch
-		x = [(codes.to(device), None)]
-
-	wav = model.decode(x, **kwargs)
-
-	# encodec will decode as a batch
+		wav = model.decode(x, bandwidth_id=model.bandwidth_id)
+	
 	if model.backend == "encodec":
-		wav = wav[0]
+		x = [(codes.to(device), None)]
+		wav = model.decode(x)[0]
 
-	return wav, model.sample_rate
+	return wav, cfg.sample_rate
+
+@torch.inference_mode()
+def decode_batch(codes: list[Tensor], device="cuda", dtype=None):
+	# transpose if needed
+	for i, code in enumerate(codes):
+		if code.shape[0] < code.shape[1]:
+			codes[i] = code.t()
+
+	# store lengths
+	lens = torch.tensor([code.shape[0] for code in codes], device=device, dtype=torch.int32)
+
+	# pad and concat
+	codes = pad_sequence(codes, batch_first=True)
+
+	# re-transpose if needed
+	if codes.shape[1] > codes.shape[2]:
+		codes = rearrange(codes, "b t q -> b q t")
+
+	# upcast so it won't whine
+	if codes.dtype in [torch.int8, torch.int16, torch.uint8]:
+		codes = codes.to(torch.int32)
+
+	assert codes.dim() == 3, f'Requires shape (b q t) but got {codes.shape}'
+
+	# load the model
+	model = _load_model(device, dtype=dtype)
+	# move to device
+	codes = codes.to( device=device )
+
+	# NeMo uses a different pathway
+	if model.backend == "nemo":
+		wav, lens = model.decode(tokens=codes, tokens_len=lens)
+		return [ wav[:l].unsqueeze(0) for wav, l in zip(wav, lens) ], cfg.sample_rate
+
+	# to-do: implement for encodec and vocos
+	raise Exception(f"Batch decoding unsupported for backend {cfg.audio_backend}")
 
 # huh
 def decode_to_wave(resps: Tensor, device="cuda"):
@@ -428,110 +310,106 @@ def decode_to_file(resps: Tensor, path: Path, device="cuda"):
 def _replace_file_extension(path, suffix):
 	return (path.parent / path.name.split(".")[0]).with_suffix(suffix)
 
-# an experimental way to include "trained" embeddings from the audio backend itself
-# > b-but why not just initialize the embedding weights to these instead of fetching them at r-runtime
-# each audio backend does their "embeddings" a different way that isn't just a embedding weights
-#
-# this is overkill and I don't feel like this benefits anything, but it was an idea I had
-# this only really works if the embedding dims match, and either a Linear to rescale would be needed or semi-erroneously just padding with 0s
 @torch.inference_mode()
-def encode_as_embedding(codes: Tensor, quant_level: int = 0, sums=False, device="cuda"):
-	model = _load_model(device)
-
-	codes = codes.to(device=device, dtype=torch.int32)
-
-	# yucky kludge
-	if sums:
-		if codes.dim() == 1:
-			codes = rearrange(codes, "t -> t 1")
-
-		if cfg.audio_backend == "dac":
-			x = []
-			for i in range(quant_level+1):
-				emb = model.quantizer.quantizers[i]
-				code = rearrange(codes[:, quant_level], "t -> 1 t")
-
-				xi = emb.decode_code(code)
-				xi = emb.out_proj(xi)
-				x.append( xi[0].t() )
-
-			return sum(x).detach()
-
-		raise Exception(f'Currently only DAC is supported')
-
-
-	if codes.dim() == 2:
-		codes = codes[:, quant_level]
-
-	codes = rearrange(codes, "t -> 1 t")
-
-	# dac conveniently has its dim = 1024
-	if cfg.audio_backend == "dac":
-		emb = model.quantizer.quantizers[quant_level]
-
-		x = emb.decode_code(codes)
-		x = emb.out_proj(x)
-		x = x[0].t().detach()
-
-		return x
-
-	"""
-	# vocos inconveniently has its dim = 128
-	elif cfg.audio_backend == "vocos":
-		x = model.codes_to_features(codes)
-	# encodec inconveniently has its dim = 300
-	elif cfg.audio_backend == "encodec":
-		...
-	"""
-
-	raise Exception(f'Currently only DAC is supported')
-
-@torch.inference_mode()
-def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", return_metadata=True, window_duration=None):
-	# DAC uses a different pathway
-	if cfg.audio_backend == "dac":
-		# model = _load_dac_model( device )
-		# signal = AudioSignal(wav, sample_rate=sr)
-		
-		# artifact = model.compress(signal, win_duration=window_duration, verbose=False) # , n_quantizers=levels)
-		# #artifact = model.compress(signal)
-		# return artifact.codes if not return_metadata else artifact
-		sys.exit("dac is not supported in this version")
-
-	# AudioDec uses a different pathway
-	if cfg.audio_backend == "audiodec":
-		# model = _load_audiodec_model(device)
-		# # reshape (channel, samples) => (batch, channel, samples)
-		# if wav.dim() < 3:
-		# 	wav = wav.unsqueeze(0)
-		# # skip unnecessary resample
-		# if sr != model.sample_rate or wav.shape[1] != 1:
-		# 	wav = convert_audio(wav, sr, model.sample_rate, 1)
-		# wav = wav.to(device)
-
-		# # wav = rearrange(wav, "t c -> t 1 c").to(device)
-		# encoded = model.tx_encoder.encode(wav)
-		# quantized = model.tx_encoder.quantize(encoded)
-		# return quantized
-		sys.exit("audiodec is not supported in this version")
-
-	# vocos does not encode wavs to encodecs, so just use normal encodec
-	model = _load_encodec_model(device)
-	# reshape (channel, samples) => (batch, channel, samples)
+def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", dtype=None, return_metadata=True, window_duration=None):
+	# expand if 1D
+	if wav.dim() < 2:
+		wav = wav.unsqueeze(0)
+	# reshape (channels, samples) => (batch, channel, samples)
 	if wav.dim() < 3:
 		wav = wav.unsqueeze(0)
-	# skip unnecessary resample
-	if sr != model.sample_rate or wav.shape[1] != model.channels:
-		wav = convert_audio(wav, sr, model.sample_rate, model.channels)
 
+	if dtype is not None:
+		wav = wav.to(dtype)
+
+	# cringe assert
+	assert wav.shape[0] == 1, f'Batch encoding is unsupported with vanilla encode()'
+	
+	model = _load_encodec_model( device, dtype=dtype ) if cfg.audio_backend == "vocos" else _load_model( device, dtype=dtype )
+
+	# DAC uses a different pathway
+	if cfg.audio_backend == "dac":
+		signal = AudioSignal(wav, sample_rate=sr)
+		
+		artifact = model.compress(signal, win_duration=window_duration, verbose=False)
+		return artifact.codes if not return_metadata else artifact
+	
+	# resample if necessary
+	if sr != cfg.sample_rate or wav.shape[1] != 1:
+		dtype = wav.dtype
+		wav = convert_audio(wav.to(torch.float32), sr, cfg.sample_rate, 1).to(dtype)
+	
 	wav = wav.to(device)
 
-	with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
-		encoded_frames = model.encode(wav)
-	qnt = torch.cat([encoded[0] for encoded in encoded_frames], dim=-1)  # (b q t)
+	# NeMo uses a different pathway
+	if cfg.audio_backend == "nemo":
+		wav = wav.to(device)[:, 0, :]
+		l = torch.tensor([w.shape[0] for w in wav]).to(device)
+		with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+			codes, lens = model.encode(audio=wav, audio_len=l)		
+		# to-do: unpad 		
+		return codes
 
-	return qnt
+	# vocos does not encode wavs to encodecs, so just use normal encodec
+	if cfg.audio_backend in ["encodec", "vocos"]:
+		with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+			codes = model.encode(wav)
+		codes = torch.cat([code[0] for code in codes], dim=-1)  # (b q t)
+		return codes
 
+@torch.inference_mode()
+def encode_batch( wavs: list[Tensor], sr: list[int] | int = cfg.sample_rate, device="cuda", dtype=None ):
+	# expand as list
+	if not isinstance(sr, list):
+		sr = [sr] * len(wavs)
+
+	# resample if necessary
+	for i, wav in enumerate(wavs):
+		if sr[i] != cfg.sample_rate or wavs[i].shape[1] != 1:
+			dtype = wav.dtype
+			wavs[i] = convert_audio(wavs[i].to(torch.float32), sr[i], cfg.sample_rate, 1).to(dtype)
+
+		# (frames) => (channel, frames)
+		if wavs[i].dim() < 2:
+			wavs[i] = wavs[i].unsqueeze(0)
+
+		# transpose is required
+		if wavs[i].shape[0] < wavs[i].shape[1]:
+			wavs[i] = wavs[i].t()
+
+	# store lengths
+	lens = torch.tensor([wav.shape[0] for wav in wavs], device=device, dtype=torch.int32)
+
+	# pad and concat (transpose because pad_sequence requires it this way)
+	wav = pad_sequence(wavs, batch_first=True)
+	# untranspose
+	wav = rearrange(wav, "b t c -> b c t")
+	#
+	wav = wav.to(device)
+
+	if dtype is not None:
+		wav = wav.to(dtype)
+	
+	model = _load_encodec_model( device, dtype=dtype ) if cfg.audio_backend == "vocos" else _load_model( device, dtype=dtype )
+
+	# NeMo uses a different pathway
+	if cfg.audio_backend == "nemo":
+		wav = wav.to(device)[:, 0, :]
+		with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+			codes, code_lens = model.encode(audio=wav, audio_len=lens)
+		return [ code[:, :l] for code, l in zip( codes, code_lens ) ]
+
+	# can't be assed to implement
+	if cfg.audio_backend == "dac":
+		raise Exception(f"Batch encoding unsupported for backend {cfg.audio_backend}")
+
+	# naively encode
+	if cfg.audio_backend in ["encodec", "vocos"]:
+		with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+			codes = model.encode(wav)
+		codes = torch.cat([code[0] for code in codes], dim=-1)  # (b q t)
+
+		return [ code[:, :l * cfg.dataset.frames_per_second // cfg.sample_rate] for code, l in zip(codes, lens) ]
 
 def encode_from_files(paths, device="cuda"):
 	tuples = [ torchaudio.load(str(path)) for path in paths ]
@@ -568,6 +446,15 @@ def encode_from_file(path, device="cuda"):
 Helper Functions
 """
 
+def post_process( codes ):
+	# artifact was saved as a batch
+	if codes.dim() == 3:
+		codes = codes[0]
+	# (codebook, frame) => (frame, codebook)
+	if codes.shape[0] < codes.shape[1]:
+		codes = codes.t()
+	return codes
+
 # DAC "silence": [ 568,  804,   10,  674,  364,  981,  568,  378,  731]
 
 # trims from the start, up to `target`
@@ -595,7 +482,8 @@ def trim( qnt, target, reencode=False, device="cuda" ):
 	end = end / cfg.dataset.frames_per_second * cfg.sample_rate
 	
 	wav = decode(qnt, device=device)[0]
-	return encode(wav[start:end], cfg.sample_rate, device=device)[0].t()
+	res = encode(wav[start:end], cfg.sample_rate, device=device)
+	return post_process( res )
 
 # trims a random piece of audio, up to `target`
 # to-do: try and align to EnCodec window
@@ -636,7 +524,7 @@ def interleave_audio( *args, audio=None ):
 		if i + 1 != len(qnts):
 			res.append( audio )
 
-	return res
+	return post_process( res )
 
 # concats two audios together
 def concat_audio( *args, reencode=False, device="cuda" ):
@@ -648,11 +536,16 @@ def concat_audio( *args, reencode=False, device="cuda" ):
 
 	decoded = [ decode(qnt, device=device)[0] for qnt in qnts ]
 	combined = torch.concat( decoded )
-	return encode(combined, cfg.sample_rate, device=device)[0].t()
+	res = encode(combined, cfg.sample_rate, device=device)
+	return post_process( res )
 
 # merges two quantized audios together
 # requires re-encoding because there's no good way to combine the waveforms of two audios without relying on some embedding magic
 def merge_audio( *args, device="cuda", scale=[] ):
+	# since this is more than likely being used in a dataloader worker, force disable CUDA since nvidia/audio-codec-44khz has problems where it'll try and use it despite the model not requesting it
+	if device == "cpu":
+		torch.cuda.is_available = lambda : False
+
 	qnts = [ *args ]
 	qnts = [ qnt for qnt in qnts if qnt is not None ]
 	decoded = [ decode(qnt, device=device)[0] for qnt in qnts ]
@@ -672,7 +565,8 @@ def merge_audio( *args, device="cuda", scale=[] ):
 			decoded[i] = decoded[i] * scale[i]
 
 	combined = sum(decoded) / len(decoded)
-	return encode(combined, cfg.sample_rate, device=device)[0].t()
+	res = encode(combined, cfg.sample_rate, device=device)
+	return post_process( res )
 
 # Get framerate for a given audio backend
 def get_framerate( backend=None, sample_rate=None ):
