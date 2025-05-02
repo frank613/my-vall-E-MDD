@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import time
+import pdb
 
 from torch import Tensor, einsum, nn
 from einops import rearrange
@@ -186,7 +187,6 @@ def cfg_logits( logits, null, strength, lens, rescale=0.0 ):
 			dims = tuple(range(1, summed.ndim - 1))
 			factor = rescale * (pos.std(dims, keepdim=True) / summed.std(dims, keepdim=True)) + (1 - rescale)
 			logits[i][-seq_len:] = summed * factor
-
 	return logits
 
 # Credit to: https://github.com/basusourya/mirostat/

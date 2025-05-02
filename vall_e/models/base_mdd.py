@@ -100,9 +100,14 @@ def _dropout_mask( input, p=None ):
 	mask = torch.tensor( seq, dtype=torch.bool, device=input.device )
 	return mask
 
-def _mdd_mask( pid_seq, index, length, device ):
+def _mdd_mask( pid_seq, index, length, device, mask_ratio_lv0=1 ):
     mask = torch.full((length,), False, dtype=torch.bool, device=device )
     pid, l, r = pid_seq[index]
+    if mask_ratio_lv0 is None:
+        mask_ratio_lv0 = 1
+    extend = math.floor((r-l) * (mask_ratio_lv0 - 1) / 2)
+    l = l - extend if l - extend >= 0 else 0
+    r = r + extend if r + extend <= length-1 else length-1
     mask[l:r] = True ## 1 is masked! same as above, different from below, because later will we use "where" operation 
     return mask
 
@@ -916,6 +921,7 @@ class Base(nn.Module):
   		is_nar_level_0: bool | None = None,
 		masking_resp_mdd: bool | None = None,
 		compute_mdd: bool | None = None,
+		mask_ratio_lv0: float | None = None,
 		quant_levels: int | list[int] | Tensor | None = None
 	):
 		if text_list and text_list[0] is not None:
@@ -997,7 +1003,7 @@ class Base(nn.Module):
 					inputs[i].append( ( "resp", resps_list[i] ) )
 				### mdd masking for gop
 				if pid_seq is not None:
-					mdd_mask = _mdd_mask(pid_seq, i, resps_list[i].shape[0], device)  ## mdd_mask must be provided, regardless of using mask or not
+					mdd_mask = _mdd_mask(pid_seq, i, resps_list[i].shape[0], device, mask_ratio_lv0)  ## mdd_mask must be provided, regardless of using mask or not
 					inputs[i].append( ("mdd_mask", mdd_mask ) )
 				if masking_resp_mdd is not None:
 					inputs[i].append( ("masking_resp_mdd", masking_resp_mdd) )
@@ -1396,6 +1402,7 @@ class Base(nn.Module):
      
 		device = logits[0].device
 		avg_post_list = []
+		pooled_list = []
 		# handles tasks where the prompt has task tokens injected in the middle
 		def prompt_input_to_token( input, quant_level ):
 			if isinstance(input, str):
@@ -1475,11 +1482,12 @@ class Base(nn.Module):
 						ignored = True
 				
 				if ignored:
-					token = torch.tensor( [ self.ignore_index ] * token.shape[0], device=device, dtype=torch.int16)
+					token = torch.tensor( [ self.ignore_index ] * seq_len, device=device, dtype=torch.int16)
 				
 				## for MDD, we only need once for each batch-item, so break after valid value being computed, need to check (checked)
 				if any(token != self.ignore_index):
-					assert token.shape[0] == end - start
+					assert seq_len == end - start
+					assert name == "resp"
 					## compute the avg_posterior
 					## do mean than log 
      				# cur_logit = logits[batch_index][start:end].softmax(dim=-1)
@@ -1495,8 +1503,10 @@ class Base(nn.Module):
 					assert len(index1) == len(index2)
 					avg_posterior = (cur_logit - cur_logit.logsumexp(dim=-1, keepdim=True))[index1, index2].mean()
 					avg_post_list.append(avg_posterior.item())
-					break
-		return avg_post_list
+     
+					pooled_value = cur_logit[index1[0]:index1[0]+len(index1), :].softmax(dim=-1).mean(dim=0)[index2].mean().log().item()
+					pooled_list.append(pooled_value)
+		return avg_post_list, pooled_list
 
 	def calc_loss(
 		self,
@@ -1867,7 +1877,8 @@ class Base(nn.Module):
 				logits[batch_index] = logits[batch_index][:, start:end]
 
 		if not training:
-			loss = self.calc_avg_posterior(inputs=inputs, logits=logits, quant_levels=quant_levels)
+			
+			loss_1, loss_2 = self.calc_avg_posterior(inputs=inputs, logits=logits, quant_levels=quant_levels)
 			stats = None
 
 			self.stats = None
@@ -1907,7 +1918,7 @@ class Base(nn.Module):
 			# self.stats = stats
 			
 		# rewrap, because we're modifying the logits here
-		return Logits(logits, output.state, inputs, loss, output.attentions, hidden_states, exited_layer)
+		return Logits(logits, output.state, inputs, (loss_1, loss_2), output.attentions, hidden_states, exited_layer)
 
 	def sample(
 		self,

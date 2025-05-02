@@ -32,6 +32,37 @@ from .lora import enable_lora
 from ..samplers import cfg_logits
 
 text_task = [ "stt", "phn", "un-phn" ]
+##define it here for the ease 
+def mdd_mask( pid_seq, index, length, mask_ratio, device):
+    mask = torch.full((length,), False, dtype=torch.bool, device=device )
+    pid, l, r = pid_seq[index]
+    if mask_ratio < 1:
+        sys.exit("mask_ratio must greater than 1") 
+    extend = math.floor((r-l) * (mask_ratio - 1) / 2)
+    l = l - extend if l - extend >= 0 else 0
+    r = r + extend if r + extend <= length-1 else length-1
+    mask[l:r] = True ## 1 is masked! same as above, different from below, because later will we use "where" operation 
+    return mask
+
+##define it here for the ease
+def compute_cfg_posterior(logits, pid_seq, resps_list):
+	assert len(logits) == len(pid_seq) and len(resps_list) == len(pid_seq)
+	device = logits[0].device
+	avg_post_list = []
+	pooled_list = []
+	for batch_index, logit in enumerate(logits):
+		seq_len = resps_list[batch_index].shape[0]
+		logit = logit[-seq_len:]
+		mask = mdd_mask(pid_seq, batch_index, seq_len, 1, device) 
+		assert mask.shape[0] == seq_len
+		index1 = torch.nonzero(mask==True, as_tuple=True)[0].tolist()
+		index2 = resps_list[batch_index][mask].squeeze().tolist()
+		avg_posterior = (logit - logit.logsumexp(dim=-1, keepdim=True))[index1, index2].mean()
+		avg_post_list.append(avg_posterior.item())
+
+		pooled_value = logit[index1[0]:index1[0]+len(index1), :].softmax(dim=-1).mean(dim=0)[index2].mean().log().item()
+		pooled_list.append(pooled_value)
+	return avg_post_list, pooled_list
 
 class AR_NAR_MDD(Base):
 	# yikes
@@ -54,9 +85,13 @@ class AR_NAR_MDD(Base):
 		is_masking_nar_level_0: bool | None = None,
 		disable_tqdm=False,
 		use_lora=None,
-		total_levels=None,  
+		total_levels=None,
+		cfg_strength_lv0=None,
+		mask_ratio_lv0=None,
+		diff_symbol=None,
 		**sampling_kwargs,
 	):
+		cfg_rescale = sampling_kwargs.pop("cfg_rescale", 0.75)
 		# deduce batch_size
 		if text_list:
 			device = text_list[0].device
@@ -78,6 +113,7 @@ class AR_NAR_MDD(Base):
 			sys.exit("must specify the number of code levels for computing GOP")
 	
 		avg_post_list = []
+		pooled_list = []
 		iterator = trange(total_levels, desc="NAR")
 		for n in iterator:
 			level = n
@@ -99,12 +135,92 @@ class AR_NAR_MDD(Base):
 					is_nar_level_0 = True, ##False if level!=0 or AR for level 0
 					masking_resp_mdd = True,
 					compute_mdd = True,
+					mask_ratio_lv0 = mask_ratio_lv0,
 				)
-				Logits = super().forward(
+				output = super().forward(
 					inputs=inputs
 				)
-				avg_posteriors = Logits[3]
+				avg_posteriors, pooled_posteriors = output[3]
 				
+				##cfg=null prompt, does not need masking
+				if cfg_strength_lv0 is not None and cfg_strength_lv0 > 0:
+					logits = output.logits
+					null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
+					null_prom = [ None for _ in range(batch_size) ]
+					null_inputs = self.inputs(
+						text_list=null_text,
+						proms_list=null_prom,
+						resps_list=resps_list_in,
+						lang_list=lang_list,
+						tone_list=tone_list,
+						task_list=task_list,
+						raw_text_list=raw_text_list,
+						quant_levels=quant_levels,
+						pid_seq = pid_seq,
+						is_nar_level_0 = True, ##False if level!=0 or AR for level 0
+						masking_resp_mdd = True,
+						compute_mdd = True,
+					)
+					null_output = super().forward(
+						inputs=null_inputs
+					)
+					logits_null = null_output.logits
+					###number of phonemes
+					assert len(logits) == len(logits_null)
+					len_list = [ resps.shape[0] for resps in resps_list_in ]
+					logits = cfg_logits( logits=logits, null=logits_null, strength=cfg_strength_lv0, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+					##Do it here for convieniance (originially need to be done in base class)
+					avg_posteriors, pooled_posteriors = compute_cfg_posterior(logits, pid_seq, resps_list_in)
+
+				if diff_symbol is not None:
+					##currently support cfg0 for diff only
+					#assert cfg_strength_lv0 is None
+					if diff_symbol == "null":
+						diff_text = [torch.tensor([1, 2], device=device)] * len(text_list)
+					else:
+						diff_text = []
+						for i,phns in enumerate(text_list):
+							diff_phns = phns.clone()
+							diff_phns[:] = diff_symbol
+							diff_phns[0] = 1
+							diff_phns[-1] = 2
+							diff_text.append(diff_phns)
+      
+					inputs = self.inputs(
+						text_list=diff_text,
+						proms_list=proms_list,
+						resps_list=resps_list_in,
+						lang_list=lang_list,
+						tone_list=tone_list,
+						task_list=task_list,
+						raw_text_list=raw_text_list,
+						quant_levels=quant_levels,
+						pid_seq = pid_seq,
+						is_nar_level_0 = True, ##False if level!=0 or AR for level 0
+						masking_resp_mdd = True,
+						compute_mdd = True,
+						mask_ratio_lv0 = mask_ratio_lv0,
+					)
+					output = super().forward(
+						inputs=inputs
+					)
+					avg_posteriors_diff, pooled_posteriors_diff = output[3]
+					#avg_posteriors = [avg_posteriors[i] - avg_posteriors_diff[i] for i in range(len(avg_posteriors_diff)) ]
+     
+					if cfg_strength_lv0 is not None and cfg_strength_lv0 > 0:
+						logits = output.logits	
+						###number of phonemes
+						assert len(logits) == len(logits_null)
+						len_list = [ resps.shape[0] for resps in resps_list_in ]
+						logits = cfg_logits( logits=logits, null=logits_null, strength=cfg_strength_lv0, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+						##Do it here for convieniance (originially need to be done in base class)
+						avg_posteriors_diff, pooled_posteriors_diff = compute_cfg_posterior(logits, pid_seq, resps_list_in)
+      
+					avg_posteriors = [avg_posteriors[i] - avg_posteriors_diff[i] for i in range(len(avg_posteriors_diff)) ]	
+					pooled_posteriors = [pooled_posteriors[i] - pooled_posteriors_diff[i] for i in range(len(pooled_posteriors_diff)) ]
+	
+					
+	
 			elif not is_masking_nar_level_0:
 				sys.exit("only support is_masking_nar_level_0 = True")
 			else:  ## other NAR levels
@@ -127,10 +243,46 @@ class AR_NAR_MDD(Base):
 				Logits = super().forward(
 					inputs=inputs
 				)
-				avg_posteriors = Logits[3]
+				avg_posteriors, pooled_posteriors = Logits[3]
+    
+				if diff_symbol is not None:
+					if diff_symbol == "null":
+						diff_text = [torch.tensor([1, 2], device=device)] * len(text_list)
+					else:
+						diff_text = []
+						for i,phns in enumerate(text_list):
+							diff_phns = phns.clone()
+							diff_phns[:] = diff_symbol
+							diff_phns[0] = 1
+							diff_phns[-1] = 2
+							diff_text.append(diff_phns)
+      
+					inputs = self.inputs(
+						text_list=diff_text,
+						proms_list=proms_list,
+						resps_list=resps_list_in,
+						lang_list=lang_list,
+						tone_list=tone_list,
+						task_list=task_list,
+						raw_text_list=raw_text_list,
+						quant_levels=quant_levels,
+						pid_seq = pid_seq,
+						is_nar_level_0 = False,
+						masking_resp_mdd = False, ## wether to mask the resps segment derived from FA
+						compute_mdd = True,
+					)
+					output = super().forward(
+						inputs=inputs
+					)
+					avg_posteriors_diff, pooled_posteriors_diff = output[3]
+					avg_posteriors = [avg_posteriors[i] - avg_posteriors_diff[i] for i in range(len(avg_posteriors_diff)) ]
+					pooled_posteriors = [pooled_posteriors[i] - pooled_posteriors_diff[i] for i in range(len(pooled_posteriors_diff)) ]
+     
 			assert len(avg_posteriors) == len(pid_seq)
 			avg_post_list.append(avg_posteriors)
-		return avg_post_list
+			pooled_list.append(pooled_posteriors)
+   
+		return avg_post_list,pooled_list
 	
 	def forward_train(
 		self,
@@ -544,7 +696,6 @@ class AR_NAR_MDD(Base):
 		disable_tqdm=False,
 		use_lora=None,
 		n_step_level_0=None,
-		compute_mdd=None,
 		is_nar_level_0=None,
 		phoneme_mask=None,
 		**sampling_kwargs,
@@ -688,9 +839,9 @@ class AR_NAR_MDD(Base):
 		if n_steps == 1:
 			return resps_list_out,logits
 		else:
-			resps_list_in = resps_list_out
 			iterator = tqdm(torch.linspace(start_noise, end_noise, n_steps)[1:], desc="NAR Masked gen", disable=disable_tqdm)
 			for timestep in iterator:
+				resps_list_in = resps_list_out
 				# update previous list of tokens
 				prev_list = resps_list_in
 				# ramp down over time
@@ -779,6 +930,153 @@ class AR_NAR_MDD(Base):
 				]
 
 			return resps_list_out,logits
+
+	## unmaksed for plotting lv0
+	def forward_nar_unmasked(
+		self,
+
+		task_list: list[Tensor] | None = None,
+		
+		text_list: list[Tensor] | None = None,
+		proms_list: list[Tensor] | None = None,
+		resps_list: list[Tensor] | None = None,
+		
+		lang_list: list[Tensor] | None = None,
+		tone_list: list[Tensor] | None = None,
+		len_list: list[Tensor] | None = None,
+		raw_text_list: list[Tensor] | None = None,
+
+		disable_tqdm=False,
+		use_lora=None,
+		**sampling_kwargs,
+	):
+		device = text_list[0].device
+		batch_size = len(text_list)
+
+		level = 0  ## can be used for other levels too?
+		if cfg.lora is not None:
+			enable_lora( self, cfg.lora.active_level( level ) if use_lora is None else use_lora )
+
+		"""
+		def log(t, eps=1e-10):
+			return torch.log(t + eps)
+		def gumbel_noise(t):
+			noise = torch.zeros_like(t).uniform_(0, 1)
+			return -log(-log(noise))
+		def gumbel_sample(t, temperature=1.0, dim=-1):
+			return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim=dim)
+		"""
+
+		# convert (N)AR specific args
+		sampling_kwargs = convert_kwargs( sampling_kwargs, "ar_" )
+
+		min_length = sampling_kwargs.pop("min_duration", 1)
+		max_length = sampling_kwargs.pop("max_duration", 500)
+		max_steps = sampling_kwargs.get("max_steps", 25)
+		## here only one step for plotting
+		assert max_steps == 1
+		refine_on_stop = sampling_kwargs.get("refine_on_stop", False)
+		entropix_sampling = sampling_kwargs.get("entropix_sampling", False)
+		annealed_sampling = sampling_kwargs.get("annealed_sampling", True)
+
+		# greedy sampling is very, very much preferred, but using greedy logit scores later helps enough
+		temperature = sampling_kwargs.pop("temperature", 0.0)
+		minimum_cfg_strength = sampling_kwargs.get("minimum_cfg_strength", 2.5)
+		# this really helps keep audio coherent so far
+		cfg_strength = sampling_kwargs.get("cfg_strength", minimum_cfg_strength)
+		cfg_rescale = sampling_kwargs.pop("cfg_rescale", 0.75)
+		# we condition it on everything, so no noise at all
+		start_noise = 1
+		end_noise = 1
+		remasking = False
+		#max_steps = math.floor(max_steps * (end_noise - start_noise))
+
+		# to specify the initial mask used
+		vc_list = sampling_kwargs.pop("vc_list", None)
+		prefix_context = sampling_kwargs.get("prefix_context", None)
+		if vc_list is not None or prefix_context is not None:
+			sys.exit("vc_list is not supprted in this MDD version")
+		
+		# force set CFG because too low / no CFG causes issues
+		original_cfg_strength = cfg_strength
+		cfg_strength = max( cfg_strength, minimum_cfg_strength )
+
+		len_list = [ clamp(resps.shape[0], min_length, max_length) for resps in resps_list ]
+		annealing = 1.0 - start_noise
+		sampling_temperature = temperature * annealing if annealed_sampling else temperature
+  
+		quant_levels = [ level for _ in range(batch_size) ]
+		null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
+		null_prom = [ None for _ in range(batch_size) ]
+
+		## generate only once
+		resps_list_in = resps_list
+		len_list = [ clamp(resps.shape[0], min_length, max_length) for resps in resps_list_in ]
+		annealing = 1.0 - start_noise
+		sampling_temperature = temperature * annealing if annealed_sampling else temperature
+  
+		# setup inputs
+		inputs = super().inputs(
+			text_list=text_list,
+			proms_list=proms_list,
+			resps_list=resps_list_in,
+			lang_list=lang_list,
+			tone_list=tone_list,
+			quant_levels=quant_levels,
+			is_nar_level_0=True, ##False if level!=0 or AR for level 0
+			compute_mdd=False,
+		)
+		output = super().forward(
+			inputs=inputs,
+			quant_levels=quant_levels,
+		)
+
+		logits = output.logits
+
+		if cfg_strength > 0:
+			null_inputs = super().inputs(
+				text_list=null_text,
+				proms_list=null_prom,
+				resps_list=resps_list_in,
+				lang_list=lang_list,
+				tone_list=tone_list,
+				quant_levels=quant_levels,
+				is_nar_level_0=True, ##False if level!=0 or AR for level 0
+				compute_mdd=False,
+			)
+			null_output = super().forward(
+				inputs=null_inputs,
+				quant_levels=quant_levels,
+			)
+
+			logits = cfg_logits( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+
+		# sample with sampler settings
+		filtered_sampled = super().sample(
+			logits=logits,
+			prev_list=resps_list,
+			quant_levels=quant_levels,
+
+			temperature=sampling_temperature,
+			**sampling_kwargs,
+		)
+
+		# retrieves unfiltered logits
+		unfiltered_sampled = super().sample(
+			logits=logits,
+			prev_list=resps_list,
+			quant_levels=quant_levels,
+
+			temperature=0.0,
+			**sampling_kwargs,
+		)
+		# get sampled tokens
+		sampled_ids = filtered_sampled.ids
+		# keep unmasked tokens
+		resps_list_out = sampled_ids
+  
+		return resps_list_out,logits
+		
 
 	### normal nar?
 	def forward_nar(
@@ -902,6 +1200,7 @@ class AR_NAR_MDD(Base):
 
 		return prev_list
 
+ 
 	### fixed_generation
 	def forward_fixed_generation(
 		self,
@@ -1041,7 +1340,7 @@ class AR_NAR_MDD(Base):
 	):
 		if len(resps_list) != 1:
 			sys.exit("masked generation only once at a time")
-		if resps_list[0].shape[-1] != 1:
+		if resps_list[0].shape[-1] != 1 :
 			sys.exit("masked generation needs only one level of code")
 		# deduce batch_size
 		# if text_list:
@@ -1255,6 +1554,135 @@ class AR_NAR_MDD(Base):
 			mask_token = 0 
 			prev_code = torch.where( phoneme_mask, mask_token, resps_list[0] if resps_list[0].dim() == 1 else resps_list[0][:, 0])
 			prev_list = [prev_code[:,None]]
+   
+		null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
+		null_prom = [ None for _ in range(batch_size) ]
+
+		iterator = trange( max_levels, desc="NAR", disable=disable_tqdm )
+		for n in iterator:
+			##rewrite previous list with input
+			prev_list = [ resps[:, :n+1] for resps in resps_list]
+			level = prev_list[0].shape[-1]
+			if level >= max_levels + 1:
+				iterator.close()
+				break
+
+			if cfg.lora is not None:
+				enable_lora( self, cfg.lora.active_level( level ) if use_lora is None else use_lora )
+
+			quant_levels = [ level for _ in range(batch_size) ]
+
+			inputs = self.inputs(
+				text_list=text_list,
+				proms_list=proms_list,
+				resps_list=prev_list,  ### it is a BXTXL Tensor 0<L<8, codeword not embeddings! 
+				lang_list=lang_list,
+				tone_list=tone_list,
+				quant_levels=quant_levels,
+				compute_mdd=False,
+			)
+
+			output = super().forward(
+				inputs=inputs,
+				quant_levels=quant_levels,
+			)
+			logits, state = output.logits, output.state
+
+			if cfg_strength > 0:
+				null_inputs = super().inputs(
+					text_list=null_text,
+					proms_list=null_prom,
+					resps_list=prev_list,
+					lang_list=lang_list,
+					tone_list=tone_list,
+					quant_levels=quant_levels,
+					compute_mdd = False,
+				)
+				null_output = super().forward(
+					inputs=null_inputs,
+					quant_levels=quant_levels,
+				)
+				## rememebered in probAI, CFG = conditional + scale * unconditional(null_input)
+				logits = cfg_logits( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ resp.shape[0] for resp in resps_list ] )
+			
+			logits_list.append(logits)
+			sampled = super().sample(
+				logits=logits,
+				prev_list=prev_list,
+				quant_levels=quant_levels,
+				**(sampling_kwargs),
+			)
+
+			resps_list_temp = sampled.ids
+			## always concate, because next step need all the preivious code-levels for embeddings ! different from original
+			resps_list_out = [ torch.cat([rs, r.unsqueeze(-1).to(device=device)], dim=-1) for rs, r in zip(resps_list_out, resps_list_temp) ]
+
+		return resps_list_out,logits_list 
+
+	### unmask for plotting, no generation
+	def forward_unmasked_for_plotting(
+		self,
+		task_list: list[Tensor] | None = None,
+		
+		text_list: list[Tensor] | None = None,
+		proms_list: list[Tensor] | None = None,
+		resps_list: list[Tensor] | None = None,
+		
+		lang_list: list[Tensor] | None = None,
+		tone_list: list[Tensor] | None = None,
+		len_list: list[Tensor] | None = None,
+		
+		raw_text_list: list[Tensor] | None = None,
+		predict_level_0=None,
+    	n_step_level_0=None,
+		disable_tqdm=False,
+		use_lora=None,
+		**sampling_kwargs,
+	):
+		if len(resps_list) != 1:
+			sys.exit("masked plotting only once at a time")
+		if resps_list[0].shape[-1] != 8:
+			sys.exit("masked plotting needs all level of codes")
+
+
+		device = resps_list[0].device
+		batch_size = 1
+		assert len_list == [ resp.shape[0] for resp in resps_list]
+		logits_list = []
+	
+		# convert NAR specific args
+		sampling_kwargs = convert_kwargs( sampling_kwargs, "nar_" )
+
+		max_levels = sampling_kwargs.get("max_levels", 0)
+		cfg_strength = sampling_kwargs.get("cfg_strength", 0.0)
+		cfg_rescale = sampling_kwargs.pop("cfg_rescale", 0.7)
+
+		if max_levels == 0:
+			max_levels = self.n_max_levels - 1
+
+		# expand if given a raw 1D tensor
+		for i, resp in enumerate(resps_list):
+			if resp.dim() == 1:
+				resps_list[i] = resp.unsqueeze(-1)
+		
+		assert predict_level_0 == True
+		##unmasked, conditioned on all input, so no need of denoising
+		assert n_step_level_0 == 1
+		mask_token = self.stop_token
+		#quant_levels = [ 0 for i in range(batch_size)]
+		##ecker said that level0 sampling using greedy always (temperature = 0)
+		sampling_kwargs_level_0 = {"max_steps":n_step_level_0}
+
+		prev_list, nar_logits = self.forward_nar_unmasked(
+			text_list=text_list,
+			proms_list=proms_list,
+			resps_list=[resps[:,:1] for resps in resps_list],
+			lang_list=lang_list,
+			is_nar_level_0=True, ##False if level!=0 or AR for level 0
+			**sampling_kwargs_level_0,
+		)
+		resps_list_out = [prev_code[:,None] for prev_code in prev_list]
+		logits_list.append(nar_logits)
    
 		null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
 		null_prom = [ None for _ in range(batch_size) ]
@@ -1644,6 +2072,9 @@ class AR_NAR_MDD(Base):
 		phoneme_mask: Tensor | None=None,
 		n_step_level_0=None,
 		total_levels=None,
+		cfg_strength_lv0=None,
+		mask_ratio_lv0=None,
+		diff_symbol=None,     
 		disable_tqdm=False,
 		to_plot=False,
 		use_lora=None,
@@ -1681,6 +2112,9 @@ class AR_NAR_MDD(Base):
 				pid_seq=pid_seq,
 				is_masking_nar_level_0=is_masking_nar_level_0,
 				total_levels=total_levels,
+				cfg_strength_lv0=cfg_strength_lv0,
+				mask_ratio_lv0=mask_ratio_lv0,
+				diff_symbol = diff_symbol,
 				disable_tqdm=disable_tqdm,
 				use_lora=use_lora,
 				**sampling_kwargs,
@@ -1720,24 +2154,42 @@ class AR_NAR_MDD(Base):
 				n_step_level_0 = n_step_level_0,
 				**sampling_kwargs,
 			)
-		elif not is_mdd and all_tts and resps_list is not None and phoneme_mask is not None and predict_level_0 is not None and to_plot==True:
-			##do masked inference for plotting
-			return self.forward_masked_for_plotting(
-				task_list=task_list,
-				text_list=text_list,
-				proms_list=proms_list,
-				resps_list=resps_list,			
-				lang_list=lang_list,
-				tone_list=tone_list,
-				len_list=len_list,
-				raw_text_list=raw_text_list,
-				disable_tqdm=disable_tqdm,
-				use_lora=use_lora,	
-				predict_level_0=predict_level_0,
-    			phoneme_mask=phoneme_mask,
-				n_step_level_0 = n_step_level_0,
-				**sampling_kwargs,
-			)
+		elif not is_mdd and all_tts and resps_list is not None and predict_level_0 is not None and to_plot==True:
+			if phoneme_mask is None:
+				##do inference for plotting
+				return self.forward_unmasked_for_plotting(
+					task_list=task_list,
+					text_list=text_list,
+					proms_list=proms_list,
+					resps_list=resps_list,			
+					lang_list=lang_list,
+					tone_list=tone_list,
+					len_list=len_list,
+					raw_text_list=raw_text_list,
+					disable_tqdm=disable_tqdm,
+					use_lora=use_lora,	
+					predict_level_0=predict_level_0,
+					n_step_level_0 = n_step_level_0,
+					**sampling_kwargs,
+				)
+			else:
+				##do masked inference for plotting
+				return self.forward_masked_for_plotting(
+					task_list=task_list,
+					text_list=text_list,
+					proms_list=proms_list,
+					resps_list=resps_list,			
+					lang_list=lang_list,
+					tone_list=tone_list,
+					len_list=len_list,
+					raw_text_list=raw_text_list,
+					disable_tqdm=disable_tqdm,
+					use_lora=use_lora,	
+					predict_level_0=predict_level_0,
+					phoneme_mask=phoneme_mask,
+					n_step_level_0 = n_step_level_0,
+					**sampling_kwargs,
+				)
 		else:
 			sys.exit("can't not identify the task, check the inputs combinitions")
 		### for training, the dataloader/dataset will sample the tasks to train len/nar/ar...., not sure if multiple tasks are allowed for a singel batch?
