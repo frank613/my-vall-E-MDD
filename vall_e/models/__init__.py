@@ -60,25 +60,45 @@ def download_model( save_path=DEFAULT_MODEL_PATH, chunkSize = 1024 ):
 
 
 def get_model(config, training=True, is_mdd=False, **model_kwargs):
-	if not is_mdd:	
-		from .ar_nar import AR_NAR # import here because reasons
-		name = config.name
-		model = AR_NAR(
-			n_text_tokens=config.text_tokens,
-			n_audio_tokens=config.audio_tokens,
-			d_model=config.dim,
-			n_heads=config.heads,
-			n_layers=config.layers,
-			n_experts=config.experts,
-			
-			p_dropout=config.dropout,
-			
-			l_padding = config.input_alignment,
-			
-			training = training,
-			config = config,
-			**model_kwargs
-		)
+	if is_mdd:	
+		if config.version >= 7:
+			from .nar_mdd_v2 import AR_NAR_MDD_V2 # extended for MDD
+			ModelClass = AR_NAR_MDD_V2
+			cfg_kwargs = dict(
+				n_phn_tokens=config.phoneme_tokens,
+				n_audio_tokens=config.audio_tokens,
+				n_text_tokens=config.text_tokens,
+				d_model=config.dim,
+				n_heads=config.heads,
+				n_layers=config.layers,
+				n_experts=config.experts,
+				
+				p_dropout=config.dropout,
+				
+				l_padding = config.input_alignment,
+				
+				training = training,
+				config = config,
+			)
+		else:
+			from .nar_mdd import AR_NAR_MDD # extended for MDD
+			ModelClass = AR_NAR_MDD
+			cfg_kwargs = dict(
+				n_phn_tokens=config.phoneme_tokens,
+				n_audio_tokens=config.audio_tokens,
+				n_text_tokens=config.text_tokens,
+				d_model=config.dim,
+				n_heads=config.heads,
+				n_layers=config.layers,
+				n_experts=config.experts,
+				
+				p_dropout=config.dropout,
+				
+				l_padding = config.input_alignment,
+				
+				training = training,
+				config = config,
+			)
   
 	else:
 		# crunge
@@ -106,8 +126,8 @@ def get_model(config, training=True, is_mdd=False, **model_kwargs):
 			config = config,
 		)
 
-		name = config.name
-		model = ModelClass(**(cfg_kwargs | model_kwargs))
+	name = config.name
+	model = ModelClass(**(cfg_kwargs | model_kwargs))
 	_logger.info(f"{name} ({next(model.parameters()).dtype}): {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters")
 
 	return model

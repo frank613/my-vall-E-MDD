@@ -25,7 +25,8 @@ import pdb
 
 _logger = logging.getLogger(__name__)
 
-from ..emb.qnt import trim, encode_as_embedding, get_silence
+#from ..emb.qnt import trim, encode_as_embedding, get_silence
+from ..emb.qnt import trim, get_silence
 from ..utils import get_devices, setup_logging, timer, clamp, convert_kwargs
 
 from .lora import enable_lora
@@ -2195,256 +2196,256 @@ class AR_NAR_MDD(Base):
 		### for training, the dataloader/dataset will sample the tasks to train len/nar/ar...., not sure if multiple tasks are allowed for a singel batch?
 		### For level 0, Masked NAR / normal NAR training is controled by config, for other levels AR/NAR is controled by using masking for "causal" attention? 		   
 
-def example_usage():
-	cfg.device = "cuda"
-	cfg.trainer.backend = "local"
-	if cfg.audio_backend == "dac":
-		cfg.sample_rate = 44_100
+# def example_usage():
+# 	cfg.device = "cuda"
+# 	cfg.trainer.backend = "local"
+# 	if cfg.audio_backend == "dac":
+# 		cfg.sample_rate = 44_100
 
-	from functools import partial
-	from einops import repeat
-	from tqdm import tqdm
+# 	from functools import partial
+# 	from einops import repeat
+# 	from tqdm import tqdm
 
-	from ..emb.qnt import decode_to_file, unload_model, trim_random, repeat_extend_audio, concat_audio, merge_audio
-	from ..engines import Engine, Engines
-	from ..utils import wrapper as ml
-	from ..utils import setup_logging
+# 	from ..emb.qnt import decode_to_file, unload_model, trim_random, repeat_extend_audio, concat_audio, merge_audio
+# 	from ..engines import Engine, Engines
+# 	from ..utils import wrapper as ml
+# 	from ..utils import setup_logging
 	
-	import numpy as np
-	import re
+# 	import numpy as np
+# 	import re
 	
-	# cfg.model.experimental.masking_train_p = 0.5
-	cfg.hyperparameters.batch_size = 1
-	cfg.hyperparameters.gradient_accumulation_steps = 1
+# 	# cfg.model.experimental.masking_train_p = 0.5
+# 	cfg.hyperparameters.batch_size = 1
+# 	cfg.hyperparameters.gradient_accumulation_steps = 1
 
-	setup_logging()
+# 	setup_logging()
 
-	def load_artifact( path ):
-		artifact = np.load(path, allow_pickle=True)[()]
+# 	def load_artifact( path ):
+# 		artifact = np.load(path, allow_pickle=True)[()]
 
-		text = torch.tensor( cfg.tokenizer.encode( artifact["metadata"]["phonemes"] ) ).to(dtype=torch.uint8, device=cfg.device)
-		audio = torch.from_numpy(artifact["codes"].astype(np.int16))[0, :, :].t().to(dtype=torch.int16, device=cfg.device)
+# 		text = torch.tensor( cfg.tokenizer.encode( artifact["metadata"]["phonemes"] ) ).to(dtype=torch.uint8, device=cfg.device)
+# 		audio = torch.from_numpy(artifact["codes"].astype(np.int16))[0, :, :].t().to(dtype=torch.int16, device=cfg.device)
 
-		return text, audio
+# 		return text, audio
 
-	text, audio = load_artifact(f"./data/qnt.{'dac' if cfg.audio_backend == 'dac' else 'enc'}")
-	batch_size = cfg.hyperparameters.batch_size
+# 	text, audio = load_artifact(f"./data/qnt.{'dac' if cfg.audio_backend == 'dac' else 'enc'}")
+# 	batch_size = cfg.hyperparameters.batch_size
 
-	text_list = [ text ] * batch_size
-	proms_list = [ audio[:cfg.dataset.frames_per_second, :] ] * batch_size   ## 1 sec prompt only?
-	resps_list = [ audio[:cfg.dataset.frames_per_second * 4, :] ] * batch_size ## 3 sec reps as label?
+# 	text_list = [ text ] * batch_size
+# 	proms_list = [ audio[:cfg.dataset.frames_per_second, :] ] * batch_size   ## 1 sec prompt only?
+# 	resps_list = [ audio[:cfg.dataset.frames_per_second * 4, :] ] * batch_size ## 3 sec reps as label?
 
-	kwargs = {
-		'n_text_tokens': 256,
-		'n_audio_tokens': 1024,
+# 	kwargs = {
+# 		'n_text_tokens': 256,
+# 		'n_audio_tokens': 1024,
 
-		'd_model': 1024, # 256, # 1024, # 1536
-		'n_heads': 16, # 4, # 16, # 24
-		'n_layers': 12, # 32
-		'n_experts': 1 if not cfg.model else cfg.model.experts,
+# 		'd_model': 1024, # 256, # 1024, # 1536
+# 		'n_heads': 16, # 4, # 16, # 24
+# 		'n_layers': 12, # 32
+# 		'n_experts': 1 if not cfg.model else cfg.model.experts,
 
-		'p_dropout': 0.1,
+# 		'p_dropout': 0.1,
 
-		'l_padding': 8 if cfg.optimizations.fp8 else 0,
+# 		'l_padding': 8 if cfg.optimizations.fp8 else 0,
 
-		'config': cfg.model
-	}
+# 		'config': cfg.model
+# 	}
 
-	bos_id, space_id, eos_id = cfg.tokenizer.encode( " " )
-	available_tasks = [] + (["tts-ar"] if "ar" in cfg.model.capabilities else []) + (["tts-nar"] if "len" in cfg.model.capabilities else [])
+# 	bos_id, space_id, eos_id = cfg.tokenizer.encode( " " )
+# 	available_tasks = [] + (["tts-ar"] if "ar" in cfg.model.capabilities else []) + (["tts-nar"] if "len" in cfg.model.capabilities else [])
 
-	model = AR_NAR(**kwargs).to(cfg.device)
-	steps = 500 // batch_size
+# 	model = AR_NAR(**kwargs).to(cfg.device)
+# 	steps = 500 // batch_size
 
-	optimizer = cfg.hyperparameters.optimizer.lower() if cfg.yaml_path is not None else "prodigy"
-	scheduler = cfg.hyperparameters.scheduler.lower() if cfg.yaml_path is not None else ""
-	learning_rate = cfg.hyperparameters.learning_rate if cfg.yaml_path is not None else None
+# 	optimizer = cfg.hyperparameters.optimizer.lower() if cfg.yaml_path is not None else "prodigy"
+# 	scheduler = cfg.hyperparameters.scheduler.lower() if cfg.yaml_path is not None else ""
+# 	learning_rate = cfg.hyperparameters.learning_rate if cfg.yaml_path is not None else None
 
-	params = model.parameters()
-	if cfg.optimizations.dadaptation:
-		# do not combine the two
-		if scheduler == "schedulefree":
-			scheduler = ""
+# 	params = model.parameters()
+# 	if cfg.optimizations.dadaptation:
+# 		# do not combine the two
+# 		if scheduler == "schedulefree":
+# 			scheduler = ""
 
-		learning_rate = 1.0
+# 		learning_rate = 1.0
 	
-	if optimizer == "prodigy":
-		if learning_rate is None:
-			learning_rate = 1.0
+# 	if optimizer == "prodigy":
+# 		if learning_rate is None:
+# 			learning_rate = 1.0
 
-		optimizer = ml.Prodigy
-	elif optimizer == "adagrad":
-		if learning_rate is None:
-			learning_rate = 1.0e-2
+# 		optimizer = ml.Prodigy
+# 	elif optimizer == "adagrad":
+# 		if learning_rate is None:
+# 			learning_rate = 1.0e-2
 
-		optimizer = ml.Adagrad
-	elif optimizer == "adamw":
-		if learning_rate is None:
-			learning_rate = 1.0e-4
+# 		optimizer = ml.Adagrad
+# 	elif optimizer == "adamw":
+# 		if learning_rate is None:
+# 			learning_rate = 1.0e-4
 
-		optimizer = ml.AdamW
-	elif optimizer == "sdg":
-		if learning_rate is None:
-			learning_rate = 1.0e-4
+# 		optimizer = ml.AdamW
+# 	elif optimizer == "sdg":
+# 		if learning_rate is None:
+# 			learning_rate = 1.0e-4
 
-		optimizer = ml.SGD
-	elif optimizer == "apollo":
-		if learning_rate is None:
-			learning_rate = 0.01
+# 		optimizer = ml.SGD
+# 	elif optimizer == "apollo":
+# 		if learning_rate is None:
+# 			learning_rate = 0.01
 
-		optimizer = ml.Apollo
+# 		optimizer = ml.Apollo
 
-		"""
-		target_params = []
-		target_modules_list = ["attn", "mlp"]
-		for module_name, module in model.named_modules():
-			if not (isinstance(module, torch.nn.Linear)):
-				continue
-			if not any(target_key in module_name for target_key in target_modules_list):
-				continue
-			target_params.append(module.weight)
+# 		"""
+# 		target_params = []
+# 		target_modules_list = ["attn", "mlp"]
+# 		for module_name, module in model.named_modules():
+# 			if not (isinstance(module, torch.nn.Linear)):
+# 				continue
+# 			if not any(target_key in module_name for target_key in target_modules_list):
+# 				continue
+# 			target_params.append(module.weight)
 
-		param_ids = [id(p) for p in target_params]
-		regular_params = [p for p in model.parameters() if id(p) not in param_ids]
-		params = [{'params': regular_params}, {'params': target_params, 'rank': 1, 'proj': 'random', 'scale_type': 'tensor', 'scale': 128,'update_proj_gap': 200, 'proj_type': 'std'}]
-		"""
-		params = [{'params': params, 'rank': 1, 'proj': 'random', 'scale_type': 'tensor', 'scale': 128,'update_proj_gap': 200, 'proj_type': 'std'}]
-	else:
-		raise ValueError(f"Unrecognized optimizer: {optimizer}")
+# 		param_ids = [id(p) for p in target_params]
+# 		regular_params = [p for p in model.parameters() if id(p) not in param_ids]
+# 		params = [{'params': regular_params}, {'params': target_params, 'rank': 1, 'proj': 'random', 'scale_type': 'tensor', 'scale': 128,'update_proj_gap': 200, 'proj_type': 'std'}]
+# 		"""
+# 		params = [{'params': params, 'rank': 1, 'proj': 'random', 'scale_type': 'tensor', 'scale': 128,'update_proj_gap': 200, 'proj_type': 'std'}]
+# 	else:
+# 		raise ValueError(f"Unrecognized optimizer: {optimizer}")
 
-	_logger.info(f"Optimizer: {optimizer}\tLearning rate: {learning_rate}")
+# 	_logger.info(f"Optimizer: {optimizer}\tLearning rate: {learning_rate}")
 
-	optimizer = optimizer(params, lr=learning_rate)
+# 	optimizer = optimizer(params, lr=learning_rate)
 
-	if scheduler == "schedulefree":
-		if isinstance(optimizer, ml.AdamW):
-			scheduler = ml.schedulefree.AdamWScheduleFree
-		elif isinstance(optimizer, ml.SGD):
-			scheduler = ml.schedulefree.SGDScheduleFree
-		else:
-			scheduler = None
+# 	if scheduler == "schedulefree":
+# 		if isinstance(optimizer, ml.AdamW):
+# 			scheduler = ml.schedulefree.AdamWScheduleFree
+# 		elif isinstance(optimizer, ml.SGD):
+# 			scheduler = ml.schedulefree.SGDScheduleFree
+# 		else:
+# 			scheduler = None
 
-		if scheduler is not None:
-			_logger.info(f"Scheduler: {scheduler}")
-			optimizer = scheduler( model.parameters(), lr = learning_rate )
+# 		if scheduler is not None:
+# 			_logger.info(f"Scheduler: {scheduler}")
+# 			optimizer = scheduler( model.parameters(), lr = learning_rate )
 
-	if cfg.optimizations.replace and cfg.optimizations.linear:
-		model = ml.replace_linear( model )
+# 	if cfg.optimizations.replace and cfg.optimizations.linear:
+# 		model = ml.replace_linear( model )
 		
-	if cfg.optimizations.replace and cfg.optimizations.embedding:
-		model = ml.replace_embedding( model )
+# 	if cfg.optimizations.replace and cfg.optimizations.embedding:
+# 		model = ml.replace_embedding( model )
 
-	"""
-	cfg.optimizations.model_offloading = {
-		"devices": ["cuda:0", "cpu"],
-	#	"limits": [ 0.9, -1 ],
-		"assign": [[ f'layers.{i}.' for i in range(0,10) ], [ f'layers.{i}.' for i in range(11,12) ] + [ "model.norm" ]],
-	#	"limits": [ 256 * (1024 ** 2), -1 ]
-	}
-	"""
+# 	"""
+# 	cfg.optimizations.model_offloading = {
+# 		"devices": ["cuda:0", "cpu"],
+# 	#	"limits": [ 0.9, -1 ],
+# 		"assign": [[ f'layers.{i}.' for i in range(0,10) ], [ f'layers.{i}.' for i in range(11,12) ] + [ "model.norm" ]],
+# 	#	"limits": [ 256 * (1024 ** 2), -1 ]
+# 	}
+# 	"""
 	
-	engine = Engine(model=model, optimizer=optimizer)
-	engines = Engines({"ar+nar": engine})
-	engines.setup()
+# 	engine = Engine(model=model, optimizer=optimizer)
+# 	engines = Engines({"ar+nar": engine})
+# 	engines.setup()
 	
-	"""
-	if cfg.optimizations.model_offloading:
-		model = ml.offload_model( model, policy=cfg.optimizations.model_offloading )
-	"""
+# 	"""
+# 	if cfg.optimizations.model_offloading:
+# 		model = ml.offload_model( model, policy=cfg.optimizations.model_offloading )
+# 	"""
 
-	"""
-	torch.save( {
-		'module': model.state_dict()
-	}, f"./data/{cfg.model.arch_type}.pth" )
-	"""
+# 	"""
+# 	torch.save( {
+# 		'module': model.state_dict()
+# 	}, f"./data/{cfg.model.arch_type}.pth" )
+# 	"""
 
-	_logger.info(f"AR+NAR ({cfg.model.arch_type}, {cfg.audio_backend}) parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+# 	_logger.info(f"AR+NAR ({cfg.model.arch_type}, {cfg.audio_backend}) parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-	@torch.no_grad()
-	def sample_data(t=None):
-		if isinstance(t, list):
-			tasks = t
-			texts = [ text_list[0].to(cfg.device) if task not in text_task else None for i, task in enumerate( tasks ) ]
-			proms = [ proms_list[0].to(cfg.device) if task not in text_task else [ "stt" ] for i, task in enumerate( tasks ) ]
-			resps = [ None if task not in text_task else resps_list[0].to(cfg.device) for i, task in enumerate( tasks ) ]
+# 	@torch.no_grad()
+# 	def sample_data(t=None):
+# 		if isinstance(t, list):
+# 			tasks = t
+# 			texts = [ text_list[0].to(cfg.device) if task not in text_task else None for i, task in enumerate( tasks ) ]
+# 			proms = [ proms_list[0].to(cfg.device) if task not in text_task else [ "stt" ] for i, task in enumerate( tasks ) ]
+# 			resps = [ None if task not in text_task else resps_list[0].to(cfg.device) for i, task in enumerate( tasks ) ]
 
-			return texts, proms, resps, tasks
+# 			return texts, proms, resps, tasks
 
-		texts = []
-		proms = []
-		resps = []
-		tasks = []
+# 		texts = []
+# 		proms = []
+# 		resps = []
+# 		tasks = []
 
-		## else single batch, sample from possible tasks as well,usually for training, can for inference as well?
-		for i in range(s): ##batch_size=1 here
-			task = random.choice(available_tasks) if t is None else t
+# 		## else single batch, sample from possible tasks as well,usually for training, can for inference as well?
+# 		for i in range(s): ##batch_size=1 here
+# 			task = random.choice(available_tasks) if t is None else t
 
-			text = text_list[i].to(cfg.device)
-			prom = proms_list[i].to(cfg.device)
-			resp = resps_list[i].to(cfg.device)
+# 			text = text_list[i].to(cfg.device)
+# 			prom = proms_list[i].to(cfg.device)
+# 			resp = resps_list[i].to(cfg.device)
 
-			# do nothing
-			if task == "stt":
-				prom = [ task ]
-			else:
-				task = "tts" if random.random() > 0.1 or "len" not in cfg.model.capabilities else "len" ## train len preidictor for 10% of the chance?
+# 			# do nothing
+# 			if task == "stt":
+# 				prom = [ task ]
+# 			else:
+# 				task = "tts" if random.random() > 0.1 or "len" not in cfg.model.capabilities else "len" ## train len preidictor for 10% of the chance?
 
-			texts.append( text )
-			proms.append( prom )
-			resps.append( resp )
-			tasks.append( task )
+# 			texts.append( text )
+# 			proms.append( prom )
+# 			resps.append( resp )
+# 			tasks.append( task )
 
-		return texts, proms, resps, tasks
+# 		return texts, proms, resps, tasks
 
-	@torch.inference_mode()
-	def sample( name, steps=500, task=None ):
-		engine.eval() ## it does not affect model.training=false by default?
+# 	@torch.inference_mode()
+# 	def sample( name, steps=500, task=None ):
+# 		engine.eval() ## it does not affect model.training=false by default?
 
-		text_list, proms_list, resp_list, task_list = sample_data( task )
+# 		text_list, proms_list, resp_list, task_list = sample_data( task )
 
-		if task == "tts-nar": # call to forward_ar generate only one reps-level, call to forward_nar, generate for all levels?
-			len_list = engine( text_list=text_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 ) ## call to forward_ar for len
-			len_list = [ resp_list[0].shape[0] for l in len_list ] ## what? why don't use the predicted len_list? for training here?
-			resps_list = engine( text_list=text_list, proms_list=proms_list, len_list=len_list ) ##call to forward-nar automatically once provided with len_list
-		else: ## tts-ar, normal ar+nar ? 
-			resps_list = engine( text_list=text_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )  ## call to forward_ar
-			resps_list = engine( text_list=text_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 ) # call to forward_nar but not for level 0 without len_list
+# 		if task == "tts-nar": # call to forward_ar generate only one reps-level, call to forward_nar, generate for all levels?
+# 			len_list = engine( text_list=text_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 ) ## call to forward_ar for len
+# 			len_list = [ resp_list[0].shape[0] for l in len_list ] ## what? why don't use the predicted len_list? for training here?
+# 			resps_list = engine( text_list=text_list, proms_list=proms_list, len_list=len_list ) ##call to forward-nar automatically once provided with len_list
+# 		else: ## tts-ar, normal ar+nar ? 
+# 			resps_list = engine( text_list=text_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )  ## call to forward_ar
+# 			resps_list = engine( text_list=text_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 ) # call to forward_nar but not for level 0 without len_list
 
-		for i, o in enumerate(resps_list):
-			_ = decode_to_file(o.to(dtype=torch.int32), f"data/{cfg.model.arch_type}.{cfg.audio_backend}.{i}.{name}.{task}.wav", device=cfg.device)
+# 		for i, o in enumerate(resps_list):
+# 			_ = decode_to_file(o.to(dtype=torch.int32), f"data/{cfg.model.arch_type}.{cfg.audio_backend}.{i}.{name}.{task}.wav", device=cfg.device)
 
-		unload_model()
+# 		unload_model()
 
-	def train():
-		engine.train()
-		t = trange(steps)
-		for i in t:
-			texts, proms, resps, tasks = sample_data()
+# 	def train():
+# 		engine.train()
+# 		t = trange(steps)
+# 		for i in t:
+# 			texts, proms, resps, tasks = sample_data()
 
-			stats = {"step": i}
-			stats |= engine.traverse(text_list=texts, proms_list=proms, resps_list=resps, task_list=tasks, training=True)
-			stats |= {"grad_norm": engine.get_global_grad_norm()}
+# 			stats = {"step": i}
+# 			stats |= engine.traverse(text_list=texts, proms_list=proms, resps_list=resps, task_list=tasks, training=True)
+# 			stats |= {"grad_norm": engine.get_global_grad_norm()}
 
-			tqdm.write(f"{stats}")
+# 			tqdm.write(f"{stats}")
 
-		"""
-		torch.save( {
-			'module': model.state_dict()
-		}, f"./data/{cfg.model.arch_type}.pth" )
-		"""
+# 		"""
+# 		torch.save( {
+# 			'module': model.state_dict()
+# 		}, f"./data/{cfg.model.arch_type}.pth" )
+# 		"""
 
-	#sample("init", 5)
-	train()
+# 	#sample("init", 5)
+# 	train()
 
-	"""
-	if cfg.optimizations.compile:
-		model = ml.compile_model(model, backend=cfg.optimizations.compile)
-	"""
+# 	"""
+# 	if cfg.optimizations.compile:
+# 		model = ml.compile_model(model, backend=cfg.optimizations.compile)
+# 	"""
 	
-	for task in available_tasks:
-		sample("final", task=task)
+# 	for task in available_tasks:
+# 		sample("final", task=task)
 
-	engines.quit()
+# 	engines.quit()
 
-if __name__ == "__main__":
-	example_usage()
+# if __name__ == "__main__":
+# 	example_usage()

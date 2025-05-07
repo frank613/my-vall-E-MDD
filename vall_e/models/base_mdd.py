@@ -32,9 +32,10 @@ from torch.utils.checkpoint import checkpoint
 from torchmetrics.classification import BinaryAccuracy, MulticlassAccuracy, MulticlassPrecision
 
 from .arch import *
-from ..utils import wrapper as ml, clamp
+#from ..utils import wrapper as ml, clamp
+from ..utils import clamp
 from ..samplers import *
-from ..emb.qnt import encode_as_embedding
+#from ..emb.qnt import encode_as_embedding
 
 # yuck, kind of needed
 from ..data import get_task_symmap
@@ -269,26 +270,26 @@ class AudioEmbedding(nn.Module):
 
 		return x
 
-# time-step embedding
-# for the NAR-len, since it probably most likely requires encoding the timestep
-class TimeEmbedding(nn.Module):
-	def __init__(
-		self,
-		d_model
-	):
-		super().__init__()
-		self.emb = SinusoidalEmbedding(d_model)
-		self.mlp = nn.Sequential(
-			nn.Linear(d_model, d_model*4),
-			nn.SiLU(),
-			nn.Linear(d_model*4, d_model),
-		)
+# # time-step embedding
+# # for the NAR-len, since it probably most likely requires encoding the timestep
+# class TimeEmbedding(nn.Module):
+# 	def __init__(
+# 		self,
+# 		d_model
+# 	):
+# 		super().__init__()
+# 		self.emb = SinusoidalEmbedding(d_model)
+# 		self.mlp = nn.Sequential(
+# 			nn.Linear(d_model, d_model*4),
+# 			nn.SiLU(),
+# 			nn.Linear(d_model*4, d_model),
+# 		)
 
-	def forward( self, t ):
-		t = self.emb(t)
-		t = self.mlp(t)
+# 	def forward( self, t ):
+# 		t = self.emb(t)
+# 		t = self.mlp(t)
 
-		return t
+# 		return t
 
 # per-level classification
 # it might actually be "better" in the long run to only have one output head like a traditional LM, and just de-stitch it here instead of doing modulus math and whatever like the HF/experimental impl
@@ -428,11 +429,12 @@ class Base(nn.Module):
 	def __init__(
 		self,
 		
-		n_text_tokens: int = 256,
+		n_phn_tokens: int = 256,
 		n_audio_tokens: int = 1024,
-		n_raw_text_tokens: int = 8575,
+		n_text_tokens: int = 8575,
 
 		d_model: int = 512,
+  		d_ffn: int = 4,
 		n_heads: int = 8,
 		n_layers: int = 12,
 		p_dropout: float = 0.1,
@@ -450,9 +452,9 @@ class Base(nn.Module):
 		self.teaching = False
 		self.config = config
 
-		self.n_text_tokens = n_text_tokens
+		self.n_phn_tokens = n_phn_tokens
 		self.n_audio_tokens = n_audio_tokens
-		self.n_raw_text_tokens = n_raw_text_tokens
+		self.n_text_tokens = n_text_tokens
 
 		self.d_model = d_model
 		self.n_heads = n_heads
@@ -540,7 +542,7 @@ class Base(nn.Module):
 
 		# STT
 		l_classifier_names += [ "stt" ]
-		l_classifier_tokens += [ n_text_tokens ]
+		l_classifier_tokens += [ n_phn_tokens ]
 
 		# LEN
 		if "len" in self.capabilities:
@@ -549,8 +551,8 @@ class Base(nn.Module):
 
 		# TEXT => PHN / PHN => TEXT
 		if self.version >= 6:
-			l_classifier_tokens += [ n_raw_text_tokens ]
-			l_classifier_names = l_embedding_names + [ "raw_text" ]
+			l_classifier_tokens += [ n_text_tokens ]
+			l_classifier_names = l_embedding_names + [ "text" ]
 
 		n_vocab = 17702 if not split_classifiers else n_resp_tokens + 1
 
@@ -569,7 +571,7 @@ class Base(nn.Module):
 			attention_backend = "default"
 		"""
 
-		self.text_emb = Embedding(n_text_tokens, d_model)
+		self.text_emb = Embedding(n_phn_tokens, d_model)
 		self.raw_text_emb = None
 		self.langs_emb = None
 		self.tones_emb = None
@@ -628,7 +630,7 @@ class Base(nn.Module):
 			self.time_emb = None # TimeEmbedding(d_model) # if not masking_ratio else None
 
 		if self.version >= 6:
-			self.raw_text_emb = Embedding(self.n_raw_text_tokens, d_model)
+			self.raw_text_emb = Embedding(self.n_text_tokens, d_model)
 
 		if attention_backend == "auto":
 			attention_backend = "sdpa"
@@ -653,136 +655,152 @@ class Base(nn.Module):
 		elif attention_backend == "fused_attn":
 			self.l_padding = 128
 
-		if self.arch_type == "transformer":
-			self.sin_emb = SinusoidalEmbedding(d_model)
-			self.blocks = nn.ModuleList([TransformerBlock(
-				d_model=d_model,
-				n_heads=n_heads,
-				p_dropout=p_dropout if training else 0.0,
-				causal=self.causal, ## this ar-nar behavior can not be controled dynamically?
-				norm_type="ln", # adaln
-				n_levels=self.n_resp_levels,
-			) for _ in range(n_layers) ])
-		elif self.arch_type in ["llama", "mistral", "mixtral"]:
-			LlamaClass = LlamaModel_Adapted # if (self.layerskip or "len" in self.capabilities) else LlamaModel
+		# if self.arch_type == "transformer":
+		# 	self.sin_emb = SinusoidalEmbedding(d_model)
+		# 	self.blocks = nn.ModuleList([TransformerBlock(
+		# 		d_model=d_model,
+		# 		n_heads=n_heads,
+		# 		p_dropout=p_dropout if training else 0.0,
+		# 		causal=self.causal, ## this ar-nar behavior can not be controled dynamically?
+		# 		norm_type="ln", # adaln
+		# 		n_levels=self.n_resp_levels,
+		# 	) for _ in range(n_layers) ])
+		# elif self.arch_type in ["llama", "mistral", "mixtral"]:
+		# 	LlamaClass = LlamaModel_Adapted # if (self.layerskip or "len" in self.capabilities) else LlamaModel
 
-			if n_experts <= 1:
-				self.model = LlamaClass(LlamaConfig(
-					vocab_size=n_vocab,
-					hidden_size=d_model,
-					max_position_embeddings=max_position_embeddings,
-					intermediate_size=d_model*4,
-					num_hidden_layers=n_layers,
-					num_attention_heads=n_heads,
-					attention_dropout=p_dropout if training else 0.0,
-					num_key_value_heads=n_heads,
-					#sliding_window=75 * 12, # 12 second context window
-					hidden_act="gelu",
-					is_encoder_decoder=False,
-					is_decoder=True,
-					attn_implementation=hf_attention,
-					#gradient_checkpointing=self.gradient_checkpointing,
-				))
+		# 	if n_experts <= 1:
+		# 		self.model = LlamaClass(LlamaConfig(
+		# 			vocab_size=n_vocab,
+		# 			hidden_size=d_model,
+		# 			max_position_embeddings=max_position_embeddings,
+		# 			intermediate_size=d_model*4,
+		# 			num_hidden_layers=n_layers,
+		# 			num_attention_heads=n_heads,
+		# 			attention_dropout=p_dropout if training else 0.0,
+		# 			num_key_value_heads=n_heads,
+		# 			#sliding_window=75 * 12, # 12 second context window
+		# 			hidden_act="gelu",
+		# 			is_encoder_decoder=False,
+		# 			is_decoder=True,
+		# 			attn_implementation=hf_attention,
+		# 			#gradient_checkpointing=self.gradient_checkpointing,
+		# 		))
 
-				self.model = ml.replace_attention( self.model, klass=LlamaAttention_Adapted, target=LlamaAttention, mode=attention_backend )
-			else:
-				self.model = MixtralModel_Adapted(MixtralConfig(
-					vocab_size =n_resp_tokens,
-					hidden_size=d_model,
-					max_position_embeddings=max_position_embeddings,
-					intermediate_size=d_model*4,
-					num_hidden_layers=n_layers,
-					num_attention_heads=n_heads,
-					attention_dropout=p_dropout if training else 0.0,
-					num_key_value_heads=n_heads,
-					#sliding_window=75 * 12, # 12 second context window
-					output_router_logits=training,
-					hidden_act="gelu",
-					is_encoder_decoder=False,
-					is_decoder=True,
-					num_local_experts=n_experts,
-					num_experts_per_tok=min(2, n_experts),
-					attn_implementation=hf_attention,
-					#gradient_checkpointing=self.gradient_checkpointing,
-				))
-				if attention_backend not in HF_ATTENTIONS:
-					self.model = ml.replace_attention( self.model, klass=MixtralAttention_Adapted, target=MixtralAttention, mode=attention_backend )
+		# 		self.model = ml.replace_attention( self.model, klass=LlamaAttention_Adapted, target=LlamaAttention, mode=attention_backend )
+		# 	else:
+		# 		self.model = MixtralModel_Adapted(MixtralConfig(
+		# 			vocab_size =n_resp_tokens,
+		# 			hidden_size=d_model,
+		# 			max_position_embeddings=max_position_embeddings,
+		# 			intermediate_size=d_model*4,
+		# 			num_hidden_layers=n_layers,
+		# 			num_attention_heads=n_heads,
+		# 			attention_dropout=p_dropout if training else 0.0,
+		# 			num_key_value_heads=n_heads,
+		# 			#sliding_window=75 * 12, # 12 second context window
+		# 			output_router_logits=training,
+		# 			hidden_act="gelu",
+		# 			is_encoder_decoder=False,
+		# 			is_decoder=True,
+		# 			num_local_experts=n_experts,
+		# 			num_experts_per_tok=min(2, n_experts),
+		# 			attn_implementation=hf_attention,
+		# 			#gradient_checkpointing=self.gradient_checkpointing,
+		# 		))
+		# 		if attention_backend not in HF_ATTENTIONS:
+		# 			self.model = ml.replace_attention( self.model, klass=MixtralAttention_Adapted, target=MixtralAttention, mode=attention_backend )
 
-			if self.layerskip:
-				self.model.layer_dropout_p = layerskip_p_max
-				self.model.early_exit_scale = layerskip_e_scale
-				self.model.early_exit_r = layerskip_r
+		# 	if self.layerskip:
+		# 		self.model.layer_dropout_p = layerskip_p_max
+		# 		self.model.early_exit_scale = layerskip_e_scale
+		# 		self.model.early_exit_r = layerskip_r
 
-			if self.gradient_checkpointing and not self.model.gradient_checkpointing:
-				self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
-					use_reentrant=False
-				))
-		elif self.arch_type == "retnet":
-			kwargs = dict(
-				vocab_size=n_vocab,
-				decoder_embed_dim=d_model,
-				decoder_value_embed_dim =d_model * 2,
-				decoder_retention_heads=n_heads,
-				decoder_ffn_embed_dim=d_model * 4,
-				decoder_layers=n_layers,
-				dropout=p_dropout if training else 0.0,
-				checkpoint_activations=self.gradient_checkpointing,
-				activation_fn="gelu",
-				use_layernorm=self.version < 3,
-				use_biases=self.version < 3,
-				use_glu=self.version >= 3,
+		# 	if self.gradient_checkpointing and not self.model.gradient_checkpointing:
+		# 		self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
+		# 			use_reentrant=False
+		# 		))
+		# elif self.arch_type == "retnet":
+		# 	kwargs = dict(
+		# 		vocab_size=n_vocab,
+		# 		decoder_embed_dim=d_model,
+		# 		decoder_value_embed_dim =d_model * 2,
+		# 		decoder_retention_heads=n_heads,
+		# 		decoder_ffn_embed_dim=d_model * 4,
+		# 		decoder_layers=n_layers,
+		# 		dropout=p_dropout if training else 0.0,
+		# 		checkpoint_activations=self.gradient_checkpointing,
+		# 		activation_fn="gelu",
+		# 		use_layernorm=self.version < 3,
+		# 		use_biases=self.version < 3,
+		# 		use_glu=self.version >= 3,
 
-				chunkwise_recurrent=self.causal and self.causal_size > 0,
-				recurrent_chunkwise_size=self.causal_size if self.causal else 0,
-				no_output_layer=True,
-				decoder_normalize_before=True,
+		# 		chunkwise_recurrent=self.causal and self.causal_size > 0,
+		# 		recurrent_chunkwise_size=self.causal_size if self.causal else 0,
+		# 		no_output_layer=True,
+		# 		decoder_normalize_before=True,
 
-				rotary_embedding_base=10000
-			)
+		# 		rotary_embedding_base=10000
+		# 	)
 
-			if n_experts > 1:
-				kwargs.update(dict(
-					use_xmoe=True,
-					moe_freq=1,
-					moe_expert_count=n_experts,
-					moe_gating_use_fp32=False,
-				))
+		# 	if n_experts > 1:
+		# 		kwargs.update(dict(
+		# 			use_xmoe=True,
+		# 			moe_freq=1,
+		# 			moe_expert_count=n_experts,
+		# 			moe_gating_use_fp32=False,
+		# 		))
 
-			self.model = RetNetDecoder(RetNetConfig(**kwargs))
-		elif self.arch_type in ["mamba2"]:
-			self.model = Mamba2Model(Mamba2Config(
-				vocab_size=n_vocab,
-				hidden_size=d_model,
-				expand=2,
-				num_hidden_layers=n_layers*2,
-				residual_in_fp32=True,
-			))
-			if self.gradient_checkpointing and not self.model.gradient_checkpointing:
-				self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
-					use_reentrant=False
-				))
-		elif self.arch_type in ["mamba"]:
-			self.model = MambaModel(MambaConfig(
-				vocab_size=n_vocab,
-				hidden_size=d_model,
-				expand=2,
-				num_hidden_layers=n_layers*2,
-				residual_in_fp32=True,
-			))
-			if self.gradient_checkpointing and not self.model.gradient_checkpointing:
-				self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
-					use_reentrant=False
-				))
-		else:
-			raise RuntimeError(f'Unknown arch specified: {self.arch_type}')
+		# 	self.model = RetNetDecoder(RetNetConfig(**kwargs))
+		# elif self.arch_type in ["mamba2"]:
+		# 	self.model = Mamba2Model(Mamba2Config(
+		# 		vocab_size=n_vocab,
+		# 		hidden_size=d_model,
+		# 		expand=2,
+		# 		num_hidden_layers=n_layers*2,
+		# 		residual_in_fp32=True,
+		# 	))
+		# 	if self.gradient_checkpointing and not self.model.gradient_checkpointing:
+		# 		self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
+		# 			use_reentrant=False
+		# 		))
+		# elif self.arch_type in ["mamba"]:
+		# 	self.model = MambaModel(MambaConfig(
+		# 		vocab_size=n_vocab,
+		# 		hidden_size=d_model,
+		# 		expand=2,
+		# 		num_hidden_layers=n_layers*2,
+		# 		residual_in_fp32=True,
+		# 	))
+		# 	if self.gradient_checkpointing and not self.model.gradient_checkpointing:
+		# 		self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
+		# 			use_reentrant=False
+		# 		))
+		# else:
+		# 	raise RuntimeError(f'Unknown arch specified: {self.arch_type}')
 
-		if hasattr( self.model, "embeddings" ):
-			del self.model.embeddings
+		# if hasattr( self.model, "embeddings" ):
+		# 	del self.model.embeddings
+  
+		self.model_config = LlamaConfig(
+			vocab_size=0, # n_vocab,
+			hidden_size=d_model,
+			max_position_embeddings=max_position_embeddings,
+			intermediate_size=d_model*d_ffn,
+			num_hidden_layers=n_layers,
+			num_attention_heads=n_heads,
+			attention_dropout=p_dropout if training else 0.0,
+			num_key_value_heads=n_heads,
+			hidden_act="gelu",
+			is_encoder_decoder=False,
+			is_decoder=True,
+			#gradient_checkpointing=self.gradient_checkpointing,
+		)
+		self.model_config.attn_mode = attention_backend
+		self.model = LlamaModel(self.model_config)
 
 		if not split_classifiers:
 			self.classifier = nn.Linear(d_model, n_vocab, bias=classifiers_bias)
 			self.classifiers = None
-
 			self.metrics = None
 		else:
 			self.classifier = None
@@ -818,80 +836,80 @@ class Base(nn.Module):
 		hidden_states = None
 
 		# HF transformer derived model
-		if self.arch_type in ["llama", "mistral", "mixtral"]:
-			kwargs = dict(
-				inputs_embeds=x,
-				attention_mask=m,
-				past_key_values=state,
-				position_ids=position_ids,
-				use_cache=False, # not self.training,
-				output_attentions=output_attentions,
-				output_hidden_states=output_hidden_states,
-				return_dict=True,
-				is_causal=is_causal,
-			)
+		#if self.arch_type in ["llama", "mistral", "mixtral"]:
+		kwargs = dict(
+			inputs_embeds=x,
+			attention_mask=m,
+			past_key_values=state,
+			position_ids=position_ids,
+			use_cache=False, # not self.training,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=True,
+			is_causal=is_causal,
+		)
 
-			if self.n_experts > 1 and self.training:
-				kwargs["output_router_logits"] = True
+		if self.n_experts > 1 and self.training:
+			kwargs["output_router_logits"] = True
 
-			if self.layerskip and layer_skip_lambda is not None:
-				kwargs["layer_skip_lambda"] = layer_skip_lambda
+		if self.layerskip and layer_skip_lambda is not None:
+			kwargs["layer_skip_lambda"] = layer_skip_lambda
 
-			output = self.model(**kwargs)
-			x = output["last_hidden_state"]
+		output = self.model(**kwargs)
+		x = output["last_hidden_state"]
+		
+		# to-do: figure out why KV caching doesn't work
+		#if not self.training:
+		if state is not None:
+			state = output["past_key_values"]
+
+		if output_attentions:
+			attentions = output["attentions"]
+		
+		if output_hidden_states:
+			hidden_states = output["hidden_states"]
+		
+		if self.n_experts > 1 and self.training:
+			router_logits = output["router_logits"]
+			aux_loss = self.model.config.router_aux_loss_coef * load_balancing_loss_func( router_logits, self.model.config.num_local_experts, self.model.config.num_experts_per_tok, m )
+
+		# elif self.arch_type == "transformer":
+		# 	# ensures we specify a quant_level for the transformer implementation's AdaLN
+		# 	l = torch.zeros((batch_size,), dtype=torch.int32) if quant_levels is None else quant_levels
+		# 	l = l.to(device)
+		# 	# inject position information
+		# 	x = self.sin_emb.add_pe(x)
+		# 	# pass our inputs through the transformer
+		# 	for block in self.blocks:
+		# 		x = block(x, m, l)
+		# elif self.arch_type == "retnet":
+		# 	# pass our inputs through the RetNet
+		# 	x, _ = self.model(x, incremental_state=state, token_embeddings=x, features_only=True)
+		# 	if _ is not None and "l_aux" in _ and self.n_experts > 1:
+		# 		aux_loss = torch.sum(torch.stack([ t for t in _["l_aux"] if t is not None])) * 0.001
+		# elif self.arch_type in ["mamba","mamba2"]:
+		# 	kwargs = dict(
+		# 		inputs_embeds=x,
+		# 		attention_mask=m,
+		# 		#cache_params=state,
+		# 		use_cache=False, # not self.training,
+		# 		#position_ids=position_ids,
+		# 		#output_attentions=output_attentions,
+		# 		output_hidden_states=output_hidden_states,
+		# 		return_dict=True,
+		# 	)
+
+		# 	output = self.model(**kwargs)
+		# 	x = output["last_hidden_state"]
 			
-			# to-do: figure out why KV caching doesn't work
-			#if not self.training:
-			if state is not None:
-				state = output["past_key_values"]
+		# 	if state is not None:
+		# 		state = output["cache_params"]
 
-			if output_attentions:
-				attentions = output["attentions"]
+		# 	if output_attentions:
+		# 		attentions = output["attentions"]
 			
-			if output_hidden_states:
-				hidden_states = output["hidden_states"]
-			
-			if self.n_experts > 1 and self.training:
-				router_logits = output["router_logits"]
-				aux_loss = self.model.config.router_aux_loss_coef * load_balancing_loss_func( router_logits, self.model.config.num_local_experts, self.model.config.num_experts_per_tok, m )
-
-		elif self.arch_type == "transformer":
-			# ensures we specify a quant_level for the transformer implementation's AdaLN
-			l = torch.zeros((batch_size,), dtype=torch.int32) if quant_levels is None else quant_levels
-			l = l.to(device)
-			# inject position information
-			x = self.sin_emb.add_pe(x)
-			# pass our inputs through the transformer
-			for block in self.blocks:
-				x = block(x, m, l)
-		elif self.arch_type == "retnet":
-			# pass our inputs through the RetNet
-			x, _ = self.model(x, incremental_state=state, token_embeddings=x, features_only=True)
-			if _ is not None and "l_aux" in _ and self.n_experts > 1:
-				aux_loss = torch.sum(torch.stack([ t for t in _["l_aux"] if t is not None])) * 0.001
-		elif self.arch_type in ["mamba","mamba2"]:
-			kwargs = dict(
-				inputs_embeds=x,
-				attention_mask=m,
-				#cache_params=state,
-				use_cache=False, # not self.training,
-				#position_ids=position_ids,
-				#output_attentions=output_attentions,
-				output_hidden_states=output_hidden_states,
-				return_dict=True,
-			)
-
-			output = self.model(**kwargs)
-			x = output["last_hidden_state"]
-			
-			if state is not None:
-				state = output["cache_params"]
-
-			if output_attentions:
-				attentions = output["attentions"]
-			
-			if output_hidden_states:
-				hidden_states = output["hidden_states"]
+		# 	if output_hidden_states:
+		# 		hidden_states = output["hidden_states"]
 
 		# process it into a format that I like
 		if output_hidden_states:

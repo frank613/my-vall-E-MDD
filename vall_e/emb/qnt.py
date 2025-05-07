@@ -140,7 +140,7 @@ def _load_dac_model(device="cuda", dtype=None):
 def _load_nemo_model(device="cuda", dtype=None, model_name=None):
 	if not model_name:
 		model_name = "nvidia/audio-codec-44khz"
-
+	
 	model = AudioCodecModel.from_pretrained(model_name)
 	model = model.to(device)
 	model = model.eval()
@@ -150,8 +150,7 @@ def _load_nemo_model(device="cuda", dtype=None, model_name=None):
 
 	model.backend = "nemo"
 
-	# return model
-	sys.exit("audiodec is not supported in this version")
+	return model
 
 
 @cache
@@ -346,7 +345,7 @@ def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", dtype=None, re
 		wav = wav.to(device)[:, 0, :]
 		l = torch.tensor([w.shape[0] for w in wav]).to(device)
 		with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
-			codes, lens = model.encode(audio=wav, audio_len=l)		
+			codes, lens = model.encode(audio=wav, audio_len=l)	
 		# to-do: unpad 		
 		return codes
 

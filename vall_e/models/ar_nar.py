@@ -74,14 +74,9 @@ class AR_NAR(Base):
 		# RVQ levels to apply token dropout on
 		token_dropout_rvq_levels = self.config.experimental.token_dropout_rvq_levels
 		# RVQ levels to apply masking training on
-<<<<<<< HEAD
-		masking_train_rvq_levels = self.config.experimental.masking_train_rvq_levels  ## always [0,0] for now, for the first level of pure-NAR!!!!
-		# CFG (classifier-free guidance?)
-=======
 		masking_train_rvq_levels = self.config.experimental.masking_train_rvq_levels
 			
 		# CFG
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 		cfg_text_dropout_p = self.config.experimental.cfg_text_dropout_p if self.config is not None else 0.0
 		cfg_cond_dropout_p = self.config.experimental.cfg_cond_dropout_p if self.config is not None else 0.0
 		cfg_prom_dropout_p = self.config.experimental.cfg_prom_dropout_p if self.config is not None else 0.0
@@ -271,10 +266,6 @@ class AR_NAR(Base):
 		else:
 			level = quant_levels[0] # ugh
 
-<<<<<<< HEAD
-		level = 0  ## can be used for other levels too?
-=======
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 		if cfg.lora is not None:
 			enable_lora( self, cfg.lora.active_level( level ) if use_lora is None else use_lora )
 
@@ -306,12 +297,7 @@ class AR_NAR(Base):
 		cfg_rescale = sampling_kwargs.pop("cfg_rescale", 0.75)
 		start_noise = sampling_kwargs.get("denoise_start", 0.0)
 		end_noise = sampling_kwargs.get("denoise_end", 1.0)
-<<<<<<< HEAD
-		remasking = sampling_kwargs.get("remasking", True)
-		max_steps = math.floor(max_steps * (end_noise - start_noise)) ### when not fully 0->1?
-=======
 		max_steps = math.floor(max_steps * (end_noise - start_noise))
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 
 		largest_score = 1.0
 		smallest_score = 0.0 # -float("inf")
@@ -375,11 +361,7 @@ class AR_NAR(Base):
 			# normal masking
 			if vc_list is None or timestep >= vc_threshold:
 				# mask off inputs
-<<<<<<< HEAD
-				resps_list = [ resp.scatter(0, indices, self.stop_token) for resp, indices in zip( resps_list, masked_indices ) ]  ### why stop_token here, not "0" as done in the base-model forward call for batch processing ? Isn't the stop_token is for AR?
-=======
 				resps_list = [ resp.scatter(0, indices, self.mask_token) for resp, indices in zip( resps_list, masked_indices ) ]
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 				# boolean mask
 				is_masked = [ resps == self.mask_token for resps in resps_list ]
 			else:
@@ -476,7 +458,7 @@ class AR_NAR(Base):
 			resps_list = [ torch.where( masked, input_ids, resps ).to(torch.int16) for masked, input_ids, resps in zip( is_masked, sampled_ids, resps_list ) ]
 			# update scores, only updating tokens that were masked off, and force keeping unmasked tokens
 			if score_masked_only:
-				scores = [ torch.where( masked, scores.t(), smallest_score ) for masked, scores in zip( is_masked, unfiltered_sampled.scores ) ]
+				scores = [ torch.where( masked, scores.t(), largest_score ) for masked, scores in zip( is_masked, unfiltered_sampled.scores ) ]
 			else:
 				scores = [ scores for scores in unfiltered_sampled.scores ]
 
@@ -946,13 +928,8 @@ class AR_NAR(Base):
 			batch_size = len(resps_list)
 
 		# implicitly set for training
-<<<<<<< HEAD
-		if training is None and text_list is not None and resps_list is not None:
-			n_levels_set = {r.shape[-1] for r in resps_list} 
-=======
 		if training is None and (phns_list is not None or text_list is not None) and resps_list is not None:
 			n_levels_set = {r.shape[-1] for r in resps_list}
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 			n_levels = next(iter(n_levels_set))
 
 			training = n_levels == self.n_resp_levels  ## if resp is full, nothing to predict, then it's for training for sure? 
@@ -973,13 +950,8 @@ class AR_NAR(Base):
 				text_list=text_list,
 			)
 
-<<<<<<< HEAD
-		# is NAR -- no garantee of having NAR as the first q_level?
-		if (len_list is not None or resps_list is not None) and text_list is not None:
-=======
 		# is NAR
 		if (len_list is not None or resps_list is not None) and (phns_list is not None or text_list is not None):
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 			return self.forward_nar(
 				task_list=task_list,
 
@@ -1050,15 +1022,9 @@ def example_usage():
 	text, audio = load_artifact(f"./data/qnt.{cfg.audio_backend_extension}")
 	batch_size = cfg.hyperparameters.batch_size
 
-<<<<<<< HEAD
-	text_list = [ text ] * batch_size
-	proms_list = [ audio[:cfg.dataset.frames_per_second, :] ] * batch_size   ## 1 sec prompt only?
-	resps_list = [ audio[:cfg.dataset.frames_per_second * 4, :] ] * batch_size ## 3 sec reps as label?
-=======
 	phns_list = [ text ] * batch_size
 	proms_list = [ audio[:int(cfg.dataset.frames_per_second), :] ] * batch_size
 	resps_list = [ audio[:int(cfg.dataset.frames_per_second * 4), :] ] * batch_size
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 
 	kwargs = {
 		'n_audio_tokens': cfg.model.audio_tokens,
@@ -1236,15 +1202,6 @@ def example_usage():
 
 		phns_list, proms_list, resp_list, task_list = sample_data( task )
 
-<<<<<<< HEAD
-		if task == "tts-nar": # call to forward_ar generate only one reps-level, call to forward_nar, generate for all levels?
-			len_list = engine( text_list=text_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 ) ## call to forward_ar for len
-			len_list = [ resp_list[0].shape[0] for l in len_list ] ## what? why don't use the predicted len_list? for training here?
-			resps_list = engine( text_list=text_list, proms_list=proms_list, len_list=len_list ) ##call to forward-nar automatically once provided with len_list
-		else: ## tts-ar, normal ar+nar ? 
-			resps_list = engine( text_list=text_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )  ## call to forward_ar
-			resps_list = engine( text_list=text_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 ) # call to forward_nar but not for level 0 without len_list
-=======
 		if task == "tts-nar":
 			len_list = engine( phns_list=phns_list, proms_list=proms_list, task_list=["len"], max_steps=5, temperature=0.0 )
 			len_list = [ r.shape[0] for r in resp_list ]
@@ -1253,7 +1210,6 @@ def example_usage():
 			resps_list = engine( phns_list=phns_list, proms_list=proms_list, task_list=["tts"], max_duration=steps, temperature=1.0 )
 			if resps_list[0].dim() == 1 or resps_list[0].shape[-1] == 1:
 				resps_list = engine( phns_list=phns_list, proms_list=proms_list, resps_list=resps_list, temperature=0.0 )
->>>>>>> 5fe01ffc6c4a1fdbb4abce8d3b66fc4142c631e7
 
 		for i, o in enumerate(resps_list):
 			print( o.shape, o )
