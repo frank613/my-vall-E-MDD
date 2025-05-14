@@ -793,7 +793,6 @@ class Base_V2(nn.Module):
 					continue
 
 				batch.append(embedding)
-
 			x_list.append( _join( batch, self.sep ) )
 
 		return x_list

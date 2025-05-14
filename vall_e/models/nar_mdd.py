@@ -30,7 +30,7 @@ from ..emb.qnt import trim, get_silence
 from ..utils import get_devices, setup_logging, timer, clamp, convert_kwargs
 
 from .lora import enable_lora
-from ..samplers import cfg_logits
+from ..samplers import cfg_logits, cfg_logits_modified
 
 text_task = [ "stt", "phn", "un-phn" ]
 ##define it here for the ease 
@@ -41,9 +41,21 @@ def mdd_mask( pid_seq, index, length, mask_ratio, device):
         sys.exit("mask_ratio must greater than 1") 
     extend = math.floor((r-l) * (mask_ratio - 1) / 2)
     l = l - extend if l - extend >= 0 else 0
-    r = r + extend if r + extend <= length-1 else length-1
+    r = r + extend if r + extend <= length else length
     mask[l:r] = True ## 1 is masked! same as above, different from below, because later will we use "where" operation 
     return mask
+
+## compute gop for mdd-nar-v2
+def compute_gop(logit, resps, device=None):
+	#logit: T x V , resps: T
+	#return the T  gop_score for each frame
+	if device is None:
+		device = resps.device
+	len = resps.shape[0]
+	assert logit.shape[0] >= len
+	logit_temp = logit[-len:, :].softmax(dim=1)
+	one_hot = torch.zeros_like(logit_temp, device=device).scatter_(1,resps[:,None].type(torch.int64),1)
+	return (logit_temp*one_hot).sum(dim=1)
 
 ##define it here for the ease
 def compute_cfg_posterior(logits, pid_seq, resps_list):
@@ -257,7 +269,8 @@ class AR_NAR_MDD(Base):
 							diff_phns[0] = 1
 							diff_phns[-1] = 2
 							diff_text.append(diff_phns)
-      
+					## resps_list_in has the resps up to quant_level, it will reduce one level in "inputs_to_embeddings"
+					# reduced level is used for computing avg_posterior
 					inputs = self.inputs(
 						text_list=diff_text,
 						proms_list=proms_list,
@@ -285,6 +298,244 @@ class AR_NAR_MDD(Base):
    
 		return avg_post_list,pooled_list
 	
+	def forward_mdd_nar_v2(
+		self,
+		text_list: list[Tensor] | None = None,
+		proms_list: list[Tensor] | None = None,
+		resps_list: list[Tensor] | None = None,
+		lang_list: list[Tensor] | None = None,
+		tone_list: list[Tensor] | None = None,
+		disable_tqdm=False,
+		use_lora=None,
+  
+		total_levels=None,
+		cfg_strength_gop=None,
+		diff_symbol=None,
+		phoneme_mask_list=None,
+		n_step_level_0=None,
+	):
+		cfg_rescale = 0.75
+		cfg_strength = cfg_strength_gop
+		temperature = 0
+		# deduce batch_size
+		if text_list:
+			device = text_list[0].device
+			batch_size = len(text_list)
+		elif proms_list:
+			device = proms_list[0].device
+			batch_size = len(proms_list)
+		elif resps_list:
+			device = resps_list[0].device
+			batch_size = len(resps_list)
+   
+		assert self.config.experimental.token_dropout_error == 0 and self.config.experimental.token_dropout_rate == 0
+		assert total_levels == resps_list[0].shape[-1]
+		min_length = 1
+		max_length = 5000
+
+		null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
+		null_prom = [ None for _ in range(batch_size) ]
+		len_list = [ clamp(resps.shape[0], min_length, max_length) for resps in resps_list]
+		gop_list = []
+		gop_diff_list = []
+		##iterations
+		iterator = trange(total_levels, desc="NAR")
+		for n in iterator:
+			level = n
+			quant_levels = [ level for i in range(batch_size)]
+			##we constrain it here although in base model, it only sums up untill quant_level as resp embeddings, 
+			# he last level is used for computing GOP
+			resps_list_in = [ r[..., :level+1] for r in resps_list] 
+			if level == 0 :  ## for level-0 NAR, masked. Similar to v2, but here the input is only one layer: list of  T x 1 tensor
+				largest_score = 1.0
+				smallest_score = 0.0 # -float("inf")
+				start_noise_p = [phoneme_mask.sum()/len for phoneme_mask, len in zip(phoneme_mask_list, len_list) ]
+				start_noise = [ math.acos(p)/ (math.pi * 0.5) for p in start_noise_p ]
+				end_noise = [1] * batch_size
+				max_steps = n_step_level_0 + 1 
+				linspace_list_orig = [ torch.linspace(start, end, max_steps)[1:].tolist() for start, end in zip(start_noise, end_noise)]
+				# P x step -> step X P list
+				linspace_list = list(map(list, zip(*linspace_list_orig)))
+				##initial masks
+				masked_resps_list = [torch.where( phoneme_mask, self.stop_token, resps.squeeze()) for resps, phoneme_mask in zip(resps_list_in, phoneme_mask_list)]
+				masked_resps_list_diff = [torch.where( phoneme_mask, self.stop_token, resps.squeeze()) for resps, phoneme_mask in zip(resps_list_in, phoneme_mask_list)]
+				is_masked = [ resps == self.stop_token for resps in masked_resps_list ]
+				is_masked_diff = [ resps == self.stop_token for resps in masked_resps_list_diff ]
+				time_list = start_noise
+				out_probs = [ torch.zeros_like(resp.squeeze(), device=device) for resp in resps_list_in]
+				out_probs_diff = [ torch.zeros_like(resp.squeeze(), device=device) for resp in resps_list_in]
+		
+				iterator_nar = trange(max_steps-1, desc="NAR-MDD")
+				for step in iterator_nar:
+					new_time_list = linspace_list[step]
+					mask_p_list = [ math.cos( timestep * math.pi * 0.5 ) for timestep in new_time_list]
+					# full condition section
+					inputs = super().inputs(
+						text_list=text_list,
+						proms_list=proms_list,
+						resps_list=masked_resps_list,
+						lang_list=lang_list,
+						tone_list=tone_list,
+						time_list=time_list,
+						quant_levels=quant_levels,
+					)
+					output = super().forward(
+						inputs=inputs,
+					)
+
+					#logits = output.logits
+					if cfg_strength > 0:
+						null_inputs = super().inputs(
+							text_list=null_text,
+							proms_list=null_prom,
+							resps_list=masked_resps_list,
+							lang_list=lang_list,
+							tone_list=tone_list,
+							time_list=time_list,
+							quant_levels=quant_levels,
+						)
+						null_output = super().forward(
+							inputs=null_inputs,
+						)
+
+						logits = cfg_logits_modified( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+			
+					else:
+						logits = output.logits
+					# compute GOP scores, only updating tokens that were masked off, and force keeping unmasked tokens
+					gop_scores = [ torch.where( is_masked, compute_gop(logit, resp.squeeze(), device), largest_score ) for logit, is_masked, resp in zip( logits, is_masked, resps_list_in ) ]
+					# prepare for the next step
+					if new_time_list[0] != 1: 
+						# pick the worst scoring tokens to mask off, seq_len - (step+1) because we start from step 1 actually
+						masked_indices = [ score.topk( clamp( int( mask_p * seq_len ), 1, seq_len - step - 1), dim=0, largest=False ).indices for score, seq_len, mask_p in zip(gop_scores, len_list, mask_p_list) ]
+						masked_resps_list = [ resp.squeeze().scatter(0, indices, self.mask_token) for resp, indices in zip( resps_list_in, masked_indices ) ]
+						new_masked = [ resps == self.mask_token for resps in masked_resps_list ]
+						fix_masked = [ old.logical_xor(new) for new, old in zip(new_masked, is_masked)] 
+						out_probs = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked, gop_scores, out_probs)]
+						is_masked = new_masked
+				
+					else:
+					## last step done, we don't mask anymore。 collect all the gops using is_masked from previous
+						fix_masked = is_masked
+						out_probs = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked, gop_scores, out_probs)]
+
+					## diff section
+					assert diff_symbol is not None
+					if diff_symbol == "null":
+						diff_phns_list = [torch.tensor([1, 2], device=device)] * batch_size
+					else:
+						diff_phns = torch.ones_like(text_list[0], device=device) * diff_symbol 
+						diff_phns[0] = 1
+						diff_phns[-1] = 2
+						diff_phns_list = [diff_phns] * batch_size
+						
+					inputs_diff = super().inputs(
+						text_list=diff_phns_list,
+						proms_list=proms_list,
+						resps_list=masked_resps_list_diff,
+						lang_list=lang_list,
+						tone_list=tone_list,
+						time_list=time_list,
+						quant_levels=quant_levels,
+					)
+					output_diff = super().forward(
+						inputs=inputs_diff,
+					)
+
+					#logits_diff = output_diff.logits
+					if cfg_strength > 0:
+						null_inputs_diff = super().inputs(
+							text_list=null_text,
+							proms_list=null_prom,
+							resps_list=masked_resps_list_diff,
+							lang_list=lang_list,
+							tone_list=tone_list,
+							time_list=time_list,
+							quant_levels=quant_levels,
+						)
+						null_output_diff = super().forward(
+							inputs=null_inputs_diff,
+						)
+
+						logits_diff = cfg_logits_modified( logits=output_diff.logits, null=null_output_diff.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+					else:
+						logits_diff = output_diff.logits
+			
+					# compute GOP scores, only updating tokens that were masked off, and force keeping unmasked tokens
+					gop_scores_diff = [ torch.where( is_masked, compute_gop(logit, resp.squeeze(), device), largest_score ) for logit, is_masked, resp in zip( logits_diff, is_masked_diff, resps_list_in ) ]
+					#gop_scores_diff_nocfg = [ torch.where( is_masked, self.compute_gop(logit, resp, device), largest_score ) for logit, is_masked, resp in zip( output_diff.logits, is_masked_diff, resps_list ) ]
+					# prepare for the next step
+					if new_time_list[0] != 1: 
+						# pick the worst scoring tokens to mask off, seq_len - (step+1) because we start from step 1 actually
+						masked_indices_diff = [ score.topk( clamp( int( mask_p * seq_len ), 1, seq_len - step - 1), dim=0, largest=False ).indices for score, seq_len, mask_p in zip(gop_scores_diff, len_list, mask_p_list) ]
+						masked_resps_list_diff = [ resp.squeeze().scatter(0, indices, self.mask_token) for resp, indices in zip( resps_list_in, masked_indices_diff ) ]
+						new_masked_diff = [ resps == self.mask_token for resps in masked_resps_list_diff ]
+						fix_masked_diff = [ old.logical_xor(new) for new, old in zip(new_masked_diff, is_masked_diff)] 
+						out_probs_diff = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked_diff, gop_scores_diff, out_probs_diff)]
+						is_masked_diff = new_masked_diff
+					else:
+					## last step done, we don't mask anymore。 collect all the gops
+						fix_masked_diff = is_masked_diff
+						out_probs_diff = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked_diff, gop_scores_diff, out_probs_diff)]
+					
+					### update timelist
+					time_list = new_time_list			
+  
+				##collect GOP FOR LEVEL 0
+				gop_list.append(out_probs)
+				gop_diff_list.append(out_probs_diff)
+    
+			## other levels
+			else:  ## other NAR levels
+				### timesteps embedding as input are deprecated in versions >= 5, here we must have it because of using base model not base_mdd, because it signifies the using of NAR
+				inputs = self.inputs(
+					text_list=text_list[:1],
+					proms_list=proms_list[:1],
+					resps_list=resps_list_in[:1],
+					lang_list=lang_list[:1],
+					quant_levels=quant_levels[:1],
+					time_list = [1]
+				)
+				output = super().forward(
+					inputs=inputs
+				)
+	
+				## we need to implement it here in this version, no!! I think return all the frame-wise probs is better, as done in v2
+				assert len(output.logits) == 1
+				out_probs = compute_gop((output.logits)[0], resps_list_in[0][:, -1], device)
+    
+				if diff_symbol is not None:
+					if diff_symbol == "null":
+						diff_text = [torch.tensor([1, 2], device=device)] * len(text_list)
+					else:
+						diff_text = []
+						for i,phns in enumerate(text_list):
+							diff_phns = phns.clone()
+							diff_phns[:] = diff_symbol
+							diff_phns[0] = 1
+							diff_phns[-1] = 2
+							diff_text.append(diff_phns)
+      
+					inputs = self.inputs(
+						text_list=diff_text[:1],
+						proms_list=proms_list[:1],
+						resps_list=resps_list_in[:1],
+						lang_list=lang_list[:1],
+						quant_levels=quant_levels[:1],
+					)
+					output_diff = super().forward(
+						inputs=inputs
+					)
+					assert len(output_diff.logits) == 1
+					out_probs_diff = compute_gop((output_diff.logits)[0], resps_list_in[0][:, -1], device)
+     
+				## * batch_size because we want to align it with level 0 where each phoneme has different logits because of masking
+				gop_list.append([out_probs]*batch_size)
+				gop_diff_list.append([out_probs_diff]*batch_size)
+   
+		return gop_list,gop_diff_list
+  
+  
 	def forward_train(
 		self,
 		task_list: list[Tensor] | None = None,
@@ -2065,19 +2316,22 @@ class AR_NAR_MDD(Base):
 		tone_list: list[Tensor] | None = None,
 		len_list: list[Tensor] | None = None,
 		raw_text_list: list[Tensor] | None = None,
-		pid_seq: list[list] | None = None,
+		##general
+  		n_step_level_0 = None,
+		cfg_strength_lv0 = None,
+
+		##mdd
+		total_levels = None,
 		is_mdd: bool | None = None,
-		is_masking_nar_level_0: bool | None = None, 
+		phoneme_mask_list = None,
+		diff_symbol = None,
+		##tts
 		fix_level=None,
 		predict_level_0=None,
 		phoneme_mask: Tensor | None=None,
-		n_step_level_0=None,
-		total_levels=None,
-		cfg_strength_lv0=None,
-		mask_ratio_lv0=None,
-		diff_symbol=None,     
-		disable_tqdm=False,
 		to_plot=False,
+     
+		disable_tqdm=False,
 		use_lora=None,
 		**sampling_kwargs,
 	):
@@ -2098,28 +2352,47 @@ class AR_NAR_MDD(Base):
 		# check correct input for MDD
 		tts_check = [True if task=="tts" else False for task in task_list ]
 		all_tts = all(tts_check)
-		if is_mdd and all_tts and pid_seq is not None and text_list is not None and resps_list is not None and proms_list is not None:
+		if is_mdd and all_tts and phoneme_mask_list is not None and text_list is not None and resps_list is not None and proms_list is not None:
 			n_levels_set = {r.shape[-1] for r in resps_list} 
 			n_levels = next(iter(n_levels_set))
 			assert (n_levels == self.n_resp_levels)  ## resp must full 
-			return self.forward_mdd_nar(
-				task_list=task_list,
+			# return self.forward_mdd_nar(
+			# 	task_list=task_list,
+			# 	text_list=text_list,
+			# 	proms_list=proms_list,
+			# 	resps_list=resps_list,			
+			# 	lang_list=lang_list,
+			# 	tone_list=tone_list,
+			# 	raw_text_list=raw_text_list,
+			# 	pid_seq=pid_seq,
+			# 	is_masking_nar_level_0=is_masking_nar_level_0,
+			# 	total_levels=total_levels,
+			# 	cfg_strength_lv0=cfg_strength_lv0,
+			# 	mask_ratio_lv0=mask_ratio_lv0,
+			# 	diff_symbol = diff_symbol,
+			# 	disable_tqdm=disable_tqdm,
+			# 	use_lora=use_lora,
+			# 	**sampling_kwargs,
+			# )
+			return self.forward_mdd_nar_v2(
 				text_list=text_list,
 				proms_list=proms_list,
-				resps_list=resps_list,			
+				resps_list=resps_list,		
 				lang_list=lang_list,
 				tone_list=tone_list,
-				raw_text_list=raw_text_list,
-				pid_seq=pid_seq,
-				is_masking_nar_level_0=is_masking_nar_level_0,
+	
 				total_levels=total_levels,
-				cfg_strength_lv0=cfg_strength_lv0,
-				mask_ratio_lv0=mask_ratio_lv0,
+				cfg_strength_gop=cfg_strength_lv0,
+				phoneme_mask_list=phoneme_mask_list,
 				diff_symbol = diff_symbol,
+				n_step_level_0=n_step_level_0,
+    
 				disable_tqdm=disable_tqdm,
 				use_lora=use_lora,
 				**sampling_kwargs,
 			)
+
+
 		## not mdd meaning for generation
 		elif not is_mdd and all_tts and resps_list is not None and fix_level is not None:
 	    ##do fixed level generation
@@ -2195,6 +2468,7 @@ class AR_NAR_MDD(Base):
 			sys.exit("can't not identify the task, check the inputs combinitions")
 		### for training, the dataloader/dataset will sample the tasks to train len/nar/ar...., not sure if multiple tasks are allowed for a singel batch?
 		### For level 0, Masked NAR / normal NAR training is controled by config, for other levels AR/NAR is controled by using masking for "causal" attention? 		   
+
 
 # def example_usage():
 # 	cfg.device = "cuda"

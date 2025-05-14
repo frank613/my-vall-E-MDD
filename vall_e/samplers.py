@@ -190,6 +190,25 @@ def cfg_logits( logits, null, strength, lens, rescale=0.0 ):
 
 	return logits
 
+def cfg_logits_modified( logits, null, strength, lens, rescale=0.0 ):
+	ret_logits = []
+	for i, seq_len in enumerate( lens ):
+		pos = logits[i][..., -seq_len:, :]
+		neg = null[i][..., -seq_len:, :]
+
+		summed = neg + (pos - neg) * strength
+		new_logit = logits[i].clone()
+		if rescale <= 0:
+			new_logit[..., -seq_len:, :] = summed
+		else:
+			dims = tuple(range(1, summed.ndim - 1))
+			factor = rescale * (pos.std(dims, keepdim=True) / summed.std(dims, keepdim=True)) + (1 - rescale)
+			new_logit[..., -seq_len:, :] = summed * factor
+
+		ret_logits.append(new_logit)
+	return ret_logits
+
+
 # Credit to: https://github.com/basusourya/mirostat/
 # performs mirostat-based sampling
 # logits: Tensor of logit probabilities

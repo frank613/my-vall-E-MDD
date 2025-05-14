@@ -27,7 +27,7 @@ from ..emb.qnt import trim, get_silence
 from ..utils import get_devices, setup_logging, timer, clamp, convert_kwargs
 
 from .lora import enable_lora
-from ..samplers import cfg_logits
+from ..samplers import cfg_logits, cfg_logits_modified
 import sys,pdb
 
 text_task = [ "stt", "phn", "un-phn" ]
@@ -83,8 +83,11 @@ class AR_NAR_MDD_V2(Base_V2):
 		start_noise_p = [phoneme_mask.sum()/len for phoneme_mask, len in zip(phoneme_mask_list, len_list) ]
 		start_noise = [ math.acos(p)/ (math.pi * 0.5) for p in start_noise_p ]
 		end_noise = [1] * batch_size
-		max_steps = n_step_level_0
-		linspace_list = [ torch.linspace(start, end, max_steps)[1:] for start, end in zip(start_noise, end_noise)]
+		max_steps = n_step_level_0 + 1 
+		linspace_list_orig = [ torch.linspace(start, end, max_steps)[1:].tolist() for start, end in zip(start_noise, end_noise)]
+		# P x step -> step X P list
+		linspace_list = list(map(list, zip(*linspace_list_orig)))
+
 	
 		# initial mask
 		masked_resps_list = [torch.where( phoneme_mask[:,None], self.stop_token, resps) for resps, phoneme_mask in zip(resps_list, phoneme_mask_list)]
@@ -97,10 +100,10 @@ class AR_NAR_MDD_V2(Base_V2):
 		out_probs = [ torch.zeros_like(resp, device=device) for resp in resps_list]
 		out_probs_diff = [ torch.zeros_like(resp, device=device) for resp in resps_list]
   
-		iterator = trange(max_steps, desc="NAR-MDD")
+		iterator = trange(max_steps-1, desc="NAR-MDD")
 		for step in iterator:
-			noise_p_list = [ math.cos( timestep * math.pi * 0.5 ) for timestep in time_list]
-			mask_p_list = noise_p_list 
+			new_time_list = linspace_list[step]
+			mask_p_list = [ math.cos( timestep * math.pi * 0.5 ) for timestep in new_time_list]
 			# full condition section
 			inputs = super().inputs(
 				phns_list=phns_list,
@@ -116,7 +119,7 @@ class AR_NAR_MDD_V2(Base_V2):
 				quant_levels=quant_levels,
 			)
 
-			logits = output.logits
+			#logits = output.logits
 			if cfg_strength > 0:
 				null_inputs = super().inputs(
 					phns_list=null_text,
@@ -132,12 +135,14 @@ class AR_NAR_MDD_V2(Base_V2):
 					quant_levels=quant_levels,
 				)
 
-				logits = cfg_logits( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+				logits = cfg_logits_modified( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
     
+			else:
+				logits = output.logits
 			# compute GOP scores, only updating tokens that were masked off, and force keeping unmasked tokens
 			gop_scores = [ torch.where( is_masked, self.compute_gop(logit, resp, device), largest_score ) for logit, is_masked, resp in zip( logits, is_masked, resps_list ) ]
 			# prepare for the next step
-			if time_list[0] != 1: 
+			if new_time_list[0] != 1: 
 				# pick the worst scoring tokens to mask off, seq_len - (step+1) because we start from step 1 actually
 				masked_indices = [ score.topk( clamp( int( mask_p * seq_len ), 1, seq_len - step - 1), dim=0, largest=False ).indices for score, seq_len, mask_p in zip(gop_scores, len_list, mask_p_list) ]
 				masked_resps_list = [ torch.stack([resp[:, l].scatter(0, indices.t()[l], self.mask_token) for l in range(self.n_resp_levels)], dim=-1) for resp, indices in zip( resps_list, masked_indices ) ]
@@ -148,14 +153,13 @@ class AR_NAR_MDD_V2(Base_V2):
 				#timestep inputs
 			else:
 			## last step done, we don't mask anymore。 collect all the gops using is_masked from previous
-				#pdb.set_trace()
 				fix_masked = is_masked
 				out_probs = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked, gop_scores, out_probs)]
 
 			## diff section
 			assert diff_symbol is not None
 			if diff_symbol == "null":
-				diff_phns = [torch.tensor([1, 2], device=device)] * batch_size
+				diff_phns_list = [torch.tensor([1, 2], device=device)] * batch_size
 			else:
 				diff_phns = torch.ones_like(phns_list[0], device=device) * diff_symbol 
 				diff_phns[0] = 1
@@ -176,7 +180,7 @@ class AR_NAR_MDD_V2(Base_V2):
 				quant_levels=quant_levels,
 			)
 
-			logits_diff = output_diff.logits
+			#logits_diff = output_diff.logits
 			if cfg_strength > 0:
 				null_inputs_diff = super().inputs(
 					phns_list=null_text,
@@ -192,12 +196,15 @@ class AR_NAR_MDD_V2(Base_V2):
 					quant_levels=quant_levels,
 				)
 
-				logits_diff = cfg_logits( logits=output_diff.logits, null=null_output_diff.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+				logits_diff = cfg_logits_modified( logits=output_diff.logits, null=null_output_diff.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+			else:
+				logits_diff = output_diff.logits
     
 			# compute GOP scores, only updating tokens that were masked off, and force keeping unmasked tokens
 			gop_scores_diff = [ torch.where( is_masked, self.compute_gop(logit, resp, device), largest_score ) for logit, is_masked, resp in zip( logits_diff, is_masked_diff, resps_list ) ]
+			#gop_scores_diff_nocfg = [ torch.where( is_masked, self.compute_gop(logit, resp, device), largest_score ) for logit, is_masked, resp in zip( output_diff.logits, is_masked_diff, resps_list ) ]
 			# prepare for the next step
-			if time_list[0] != 1: 
+			if new_time_list[0] != 1: 
 				# pick the worst scoring tokens to mask off, seq_len - (step+1) because we start from step 1 actually
 				masked_indices_diff = [ score.topk( clamp( int( mask_p * seq_len ), 1, seq_len - step - 1), dim=0, largest=False ).indices for score, seq_len, mask_p in zip(gop_scores_diff, len_list, mask_p_list) ]
 				masked_resps_list_diff = [ torch.stack([resp[:, l].scatter(0, indices.t()[l], self.mask_token) for l in range(self.n_resp_levels)], dim=-1) for resp, indices in zip( resps_list, masked_indices_diff ) ]
@@ -205,15 +212,13 @@ class AR_NAR_MDD_V2(Base_V2):
 				fix_masked_diff = [ old.logical_xor(new) for new, old in zip(new_masked_diff, is_masked_diff)] 
 				out_probs_diff = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked_diff, gop_scores_diff, out_probs_diff)]
 				is_masked_diff = new_masked_diff
-				#timestep inputs
 			else:
 			## last step done, we don't mask anymore。 collect all the gops
-				#pdb.set_trace()
 				fix_masked_diff = is_masked_diff
 				out_probs_diff = [ out_prob + torch.where(fix_mask, gop_score ,0) if out_prob[fix_mask].sum()==0 else sys.exit("refill already fixed tokens") for fix_mask, gop_score, out_prob in zip(fix_masked_diff, gop_scores_diff, out_probs_diff)]
 			
-			## update timelist
-			time_list = linspace_list[step]
+			### update timelist
+			time_list = new_time_list
 		
 		return out_probs, out_probs_diff
 			
@@ -727,10 +732,12 @@ class AR_NAR_MDD_V2(Base_V2):
     
 		return resps_list, logits
 
-	def compute_gop(self, logit, resps, device):
+	def compute_gop(self, logit, resps, device=None):
 		#logit: 8 x T x V , resps: T x 8
   		#return the T x 8 gop_score for each frame
 		#pdb.set_trace() ## check the dim and check if already softmaxed
+		if device is None:
+			device = resps.device
 		len = resps.shape[0]
 		assert logit.shape[1] >= len
 		logit_temp = logit[:, -len:, :].transpose(0,1).transpose(1,2).softmax(dim=1)
@@ -1399,13 +1406,13 @@ class AR_NAR_MDD_V2(Base_V2):
 		mdd_check = [True if task=="mdd" else False for task in task_list ]
 		all_mdd = all(mdd_check)
   
-		# implicitly set for training
-		if training is None and (phns_list is not None or text_list is not None) and resps_list is not None and not all_mdd_plot:
-			n_levels_set = {r.shape[-1] for r in resps_list}
-			n_levels = next(iter(n_levels_set))
+		# # implicitly set for training
+		# if training is None and (phns_list is not None or text_list is not None) and resps_list is not None and not all_mdd_plot:
+		# 	n_levels_set = {r.shape[-1] for r in resps_list}
+		# 	n_levels = next(iter(n_levels_set))
 
-			training = n_levels == self.n_resp_levels
-			sys.exit("this mdd version does not support training, checking the input ")
+		# 	training = n_levels == self.n_resp_levels
+		# 	sys.exit("this mdd version does not support training, checking the input ")
 
 		# cringe
 		self.audio_frames_per_second = cfg.dataset.frames_per_second
@@ -1476,7 +1483,6 @@ class AR_NAR_MDD_V2(Base_V2):
 			elif all_mdd:
 				assert resps_list[0].shape[-1] ==  self.n_resp_levels and total_levels == self.n_resp_levels
 				return self.forward_mdd_nar(
-					task_list=task_list,
 					phns_list=phns_list,
 					proms_list=proms_list,
 					resps_list=resps_list,		
