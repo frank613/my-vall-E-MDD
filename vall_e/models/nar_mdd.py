@@ -47,7 +47,7 @@ def mdd_mask( pid_seq, index, length, mask_ratio, device):
 
 ## compute gop for mdd-nar-v2
 def compute_gop(logit, resps, device=None):
-	#logit: T x V , resps: T
+	#logit: (T+?) x V , resps: T
 	#return the T  gop_score for each frame
 	if device is None:
 		device = resps.device
@@ -150,10 +150,12 @@ class AR_NAR_MDD(Base):
 					compute_mdd = True,
 					mask_ratio_lv0 = mask_ratio_lv0,
 				)
+
 				output = super().forward(
 					inputs=inputs
 				)
 				avg_posteriors, pooled_posteriors = output[3]
+		
 				
 				##cfg=null prompt, does not need masking
 				if cfg_strength_lv0 is not None and cfg_strength_lv0 > 0:
@@ -381,8 +383,8 @@ class AR_NAR_MDD(Base):
 					)
 					output = super().forward(
 						inputs=inputs,
-					)
-
+					) 
+					#pdb.set_trace()
 					#logits = output.logits
 					if cfg_strength > 0:
 						null_inputs = super().inputs(
@@ -399,7 +401,7 @@ class AR_NAR_MDD(Base):
 						)
 
 						logits = cfg_logits_modified( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
-			
+						
 					else:
 						logits = output.logits
 					# compute GOP scores, only updating tokens that were masked off, and force keeping unmasked tokens
@@ -535,6 +537,131 @@ class AR_NAR_MDD(Base):
    
 		return gop_list,gop_diff_list
   
+	def forward_mdd_nar_nomask(
+		self,
+		text_list: list[Tensor] | None = None,
+		proms_list: list[Tensor] | None = None,
+		resps_list: list[Tensor] | None = None,
+		lang_list: list[Tensor] | None = None,
+		tone_list: list[Tensor] | None = None,
+		disable_tqdm=False,
+		use_lora=None,
+  
+		total_levels=None,
+		cfg_strength_gop=None,
+		diff_symbol=None,
+	):
+		cfg_rescale = 0.75
+		cfg_strength = cfg_strength_gop
+		temperature = 0
+		# deduce batch_size
+		if text_list:
+			device = text_list[0].device
+			batch_size = len(text_list)
+		elif proms_list:
+			device = proms_list[0].device
+			batch_size = len(proms_list)
+		elif resps_list:
+			device = resps_list[0].device
+			batch_size = len(resps_list)
+   
+		assert self.config.experimental.token_dropout_error == 0 and self.config.experimental.token_dropout_rate == 0
+		assert total_levels == resps_list[0].shape[-1]
+		min_length = 1
+		max_length = 5000
+
+		null_text = [ torch.tensor([1, 2], device=device, dtype=torch.int16) for _ in range(batch_size) ]
+		null_prom = [ None for _ in range(batch_size) ]
+		len_list = [ clamp(resps.shape[0], min_length, max_length) for resps in resps_list]
+		gop_list = []
+		gop_diff_list = []
+		##iterations
+		iterator = trange(total_levels, desc="NAR")
+		for n in iterator:
+			level = n
+			quant_levels = [ level for i in range(batch_size)]
+			##we constrain it here although in base model, it only sums up untill quant_level as resp embeddings, 
+			# provide all the resps up to the current level
+			resps_list_in = [ r[..., :level+1] for r in resps_list] 
+			
+			# full condition section
+			inputs = super().inputs(
+				text_list=text_list[:1],
+				proms_list=proms_list[:1],
+				resps_list=resps_list_in[:1],
+				lang_list=lang_list[:1],
+				is_nar_level_0 = True,
+				quant_levels=quant_levels[:1],
+			)
+			output = super().forward(
+				inputs=inputs,
+			) 
+			#pdb.set_trace()
+			#logits = output.logits
+			if cfg_strength > 0:
+				null_inputs = super().inputs(
+					text_list=null_text[:1],
+					proms_list=null_prom[:1],
+					resps_list=resps_list_in[:1],
+					lang_list=lang_list[:1],
+					is_nar_level_0 = True,
+					quant_levels=quant_levels[:1],
+				)
+				null_output = super().forward(
+					inputs=null_inputs,
+				)
+
+				logits = cfg_logits_modified( logits=output.logits, null=null_output.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+					
+			else:
+				logits = output.logits
+			gop_frames = compute_gop(logits[0], resps_list_in[0][:,-1], device)	
+			## diff section
+			assert diff_symbol is not None
+			if diff_symbol == "null":
+				diff_phns_list = [torch.tensor([1, 2], device=device)] * batch_size
+			else:
+				diff_phns = torch.ones_like(text_list[0], device=device) * diff_symbol 
+				diff_phns[0] = 1
+				diff_phns[-1] = 2
+				diff_phns_list = [diff_phns] * batch_size
+				
+			inputs_diff = super().inputs(
+				text_list=diff_phns_list[:1],
+				proms_list=proms_list[:1],
+				resps_list=resps_list_in[:1],
+				lang_list=lang_list[:1],
+				is_nar_level_0 = True,
+				quant_levels=quant_levels[:1],
+			)
+			output_diff = super().forward(
+				inputs=inputs_diff,
+			)
+
+			#logits_diff = output_diff.logits
+			if cfg_strength > 0:
+				null_inputs_diff = super().inputs(
+					text_list=null_text[:1],
+					proms_list=null_prom[:1],
+					resps_list=resps_list_in[:1],
+					lang_list=lang_list[:1],
+					is_nar_level_0 = True,
+					quant_levels=quant_levels[:1],
+				)
+				null_output_diff = super().forward(
+					inputs=null_inputs_diff,
+				)
+
+				logits_diff = cfg_logits_modified( logits=output_diff.logits, null=null_output_diff.logits, strength=cfg_strength, rescale=cfg_rescale, lens=[ l for l in len_list ] )
+			else:
+				logits_diff = output_diff.logits
+    
+			gop_frames_diff = compute_gop(logits_diff[0], resps_list_in[0][:,-1], device)
+   
+			gop_list.append([gop_frames]*batch_size)
+			gop_diff_list.append([gop_frames_diff]*batch_size)
+   
+		return gop_list,gop_diff_list
   
 	def forward_train(
 		self,
@@ -2325,6 +2452,9 @@ class AR_NAR_MDD(Base):
 		is_mdd: bool | None = None,
 		phoneme_mask_list = None,
 		diff_symbol = None,
+		pid_seq = None,
+  		is_masking_nar_level_0 = None,
+		mask_ratio_lv0 = None,
 		##tts
 		fix_level=None,
 		predict_level_0=None,
@@ -2352,45 +2482,63 @@ class AR_NAR_MDD(Base):
 		# check correct input for MDD
 		tts_check = [True if task=="tts" else False for task in task_list ]
 		all_tts = all(tts_check)
-		if is_mdd and all_tts and phoneme_mask_list is not None and text_list is not None and resps_list is not None and proms_list is not None:
+		if is_mdd and all_tts is not None and text_list is not None and resps_list is not None and proms_list is not None and diff_symbol is not None:
 			n_levels_set = {r.shape[-1] for r in resps_list} 
 			n_levels = next(iter(n_levels_set))
 			assert (n_levels == self.n_resp_levels)  ## resp must full 
-			# return self.forward_mdd_nar(
-			# 	task_list=task_list,
-			# 	text_list=text_list,
-			# 	proms_list=proms_list,
-			# 	resps_list=resps_list,			
-			# 	lang_list=lang_list,
-			# 	tone_list=tone_list,
-			# 	raw_text_list=raw_text_list,
-			# 	pid_seq=pid_seq,
-			# 	is_masking_nar_level_0=is_masking_nar_level_0,
-			# 	total_levels=total_levels,
-			# 	cfg_strength_lv0=cfg_strength_lv0,
-			# 	mask_ratio_lv0=mask_ratio_lv0,
-			# 	diff_symbol = diff_symbol,
-			# 	disable_tqdm=disable_tqdm,
-			# 	use_lora=use_lora,
-			# 	**sampling_kwargs,
-			# )
-			return self.forward_mdd_nar_v2(
+			if phoneme_mask_list is not None:
+				return self.forward_mdd_nar_v2(
+					text_list=text_list,
+					proms_list=proms_list,
+					resps_list=resps_list,		
+					lang_list=lang_list,
+					tone_list=tone_list,
+		
+					total_levels=total_levels,
+					cfg_strength_gop=cfg_strength_lv0,
+					phoneme_mask_list=phoneme_mask_list,
+					diff_symbol = diff_symbol,
+					n_step_level_0=n_step_level_0,
+		
+					disable_tqdm=disable_tqdm,
+					use_lora=use_lora,
+					**sampling_kwargs,
+				)
+
+			elif pid_seq is not None:
+				return self.forward_mdd_nar(
+				task_list=task_list,
 				text_list=text_list,
 				proms_list=proms_list,
-				resps_list=resps_list,		
+				resps_list=resps_list,			
 				lang_list=lang_list,
 				tone_list=tone_list,
-	
+				raw_text_list=raw_text_list,
+				pid_seq=pid_seq,
+				is_masking_nar_level_0=is_masking_nar_level_0,
 				total_levels=total_levels,
 				cfg_strength_gop=cfg_strength_lv0,
-				phoneme_mask_list=phoneme_mask_list,
+				mask_ratio_lv0=mask_ratio_lv0,
 				diff_symbol = diff_symbol,
-				n_step_level_0=n_step_level_0,
-    
 				disable_tqdm=disable_tqdm,
 				use_lora=use_lora,
 				**sampling_kwargs,
-			)
+				)
+			else:
+				return self.forward_mdd_nar_nomask(
+				text_list=text_list,
+				proms_list=proms_list,
+				resps_list=resps_list,			
+				lang_list=lang_list,
+				tone_list=tone_list,
+				total_levels=total_levels,
+				cfg_strength_gop=cfg_strength_lv0,
+				diff_symbol = diff_symbol,
+				disable_tqdm=disable_tqdm,
+				use_lora=use_lora,
+				**sampling_kwargs,
+				)
+				
 
 
 		## not mdd meaning for generation

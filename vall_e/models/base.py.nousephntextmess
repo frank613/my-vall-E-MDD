@@ -824,7 +824,7 @@ class Base(nn.Module):
 					dropout_mask = input
 				elif name == "timestep":
 					timestep = input
-
+			pdb.set_trace()
 			for name, input in batch_input:
 				# technically can provide a map for input_name => embedding, but some embedding requires additional processing
 				embedding = None
@@ -1247,7 +1247,7 @@ class Base(nn.Module):
 			position_ids=position_ids,
 			output_attentions = output_attentions,
 		)
-
+		pdb.set_trace()
 		logits = output.logits
 		hidden_states = output.hidden_states
 		
@@ -1494,9 +1494,9 @@ if __name__ == "__main__":
 			def forward( *args, **kwargs ):
 			 	return self.model( *args, **kwargs )
 
-		download_model()
+		#download_model()
 
-		hf_model = LlamaForCausalLM(LlamaConfig(
+		hfx_model = LlamaForCausalLM(LlamaConfig(
 			vocab_size=17702,
 			hidden_size=1024,
 			max_position_embeddings=75 * 60 * 5, # max-length of 60 seconds
